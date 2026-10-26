@@ -17,6 +17,7 @@
 #include "bytes.hpp"
 #include "derive.hpp"
 #include "fbx_write.hpp"
+#include "textbody.hpp"
 
 using namespace x3;
 
@@ -37,6 +38,8 @@ int Usage() {
           "  \"D:\\GAMES\\X3 Terran Conflict|objects/ships/argon/argon_M3.pbb\"\n");
   return 2;
 }
+
+bob::Body ReadAnyBody(const std::vector<uint8_t>& data);
 
 bool EndsWith(const std::string& s, const char* suf) {
   const size_t n = strlen(suf);
@@ -78,7 +81,32 @@ int CmdVerify(const std::string& dir) {
       if (shown++ < 20) printf("%s %s: %s\n", game.mounts[e.mount].label.c_str(), e.path.c_str(), x.what());
     }
   }
+  // text members (.pbd/.bod): bodies are read like the engine's text loader, scenes are counted
+  std::map<std::string, int> tcount;
+  for (auto& e : game.entries) {
+    if (!EndsWith(e.path, ".pbd") && !EndsWith(e.path, ".bod")) continue;
+    std::vector<uint8_t> data;
+    try {
+      data = game.Read(e);
+    } catch (...) {
+      tcount["text: unpack error"]++;
+      continue;
+    }
+    if (textbody::IsTextScene(data)) {
+      tcount["text scene (not a body)"]++;
+      continue;
+    }
+    try {
+      textbody::Read(data);
+      tcount["text body read"]++;
+    } catch (const std::exception& x) {
+      std::string why = x.what();
+      tcount["text body refused: " + why.substr(0, 60)]++;
+      if (shown++ < 30) printf("%s %s: %s\n", game.mounts[e.mount].label.c_str(), e.path.c_str(), x.what());
+    }
+  }
   for (auto& [k, v] : count) printf("%-26s %d\n", k.c_str(), v);
+  for (auto& [k, v] : tcount) printf("%-26s %d\n", k.c_str(), v);
   return count.count("BOB1 DIFFERENT") ? 1 : 0;
 }
 
@@ -100,7 +128,7 @@ std::vector<uint8_t> LoadInput(const std::string& spec, std::string* label) {
 int CmdInfo(const std::string& spec) {
   std::string label;
   const auto data = LoadInput(spec, &label);
-  const bob::Body b = bob::Read(data);
+  const bob::Body b = ReadAnyBody(data);
   printf("%s\n", label.c_str());
   for (auto& s : b.sections) {
     switch (s.kind) {
@@ -168,6 +196,13 @@ int CmdInfo(const std::string& spec) {
   return 0;
 }
 
+// a binary (BOB1) or text body
+bob::Body ReadAnyBody(const std::vector<uint8_t>& data) {
+  if (bob::IsBob(data)) return bob::Read(data);
+  if (textbody::IsTextBody(data)) return textbody::Read(data);
+  throw FormatError("not a body (a scene?)");
+}
+
 std::string Stem(const std::string& path) {
   std::string b = TextureBase(path);
   const size_t dot = b.rfind('.');
@@ -202,7 +237,7 @@ int CmdExport(const std::vector<std::string>& args) {
   if (bar != std::string::npos) game = std::make_unique<Game>(in.substr(0, bar));
   std::string label;
   const auto data = LoadInput(in, &label);
-  const bob::Body body = bob::Read(data);
+  const bob::Body body = ReadAnyBody(data);
   ExportOptions opt;
   opt.unitCm = unitMm / 10.0;
   opt.textureDir = game ? texDir : "";
@@ -254,7 +289,8 @@ int CmdRoundtripFbx(const std::string& dir, const std::string& filter) {
   int shown = 0;
   for (auto& [key, idx] : game.winners) {
     const CatEntry& e = game.entries[idx];
-    if (!EndsWith(e.path, ".pbb") && !EndsWith(e.path, ".bob")) continue;
+    const bool text = EndsWith(e.path, ".pbd") || EndsWith(e.path, ".bod");
+    if (!EndsWith(e.path, ".pbb") && !EndsWith(e.path, ".bob") && !text) continue;
     if (!filter.empty() && key.find(Game::Key(filter)) == std::string::npos) continue;
     std::vector<uint8_t> data;
     try {
@@ -262,9 +298,10 @@ int CmdRoundtripFbx(const std::string& dir, const std::string& filter) {
     } catch (...) {
       continue;
     }
-    if (!bob::IsBob(data)) continue;
+    if (text ? !textbody::IsTextBody(data) : !bob::IsBob(data)) continue;
     try {
-      const bob::Body b = bob::Read(data);
+      const bob::Body b = ReadAnyBody(data);
+      if (text) data = bob::Write(b);  // a text body compares as its binary form
       ExportOptions opt;
       const fbx::Scene sc = BodyToFbx(b, Stem(e.path), opt, nullptr);
       std::string err;

@@ -14,6 +14,7 @@ add_executable(x3model
   src/body_fbx.cpp
   src/derive.cpp
   src/fbx_write.cpp
+  src/textbody.cpp
   src/ufbx_impl.cpp
 )
 target_include_directories(x3model PRIVATE src third_party/ufbx)
