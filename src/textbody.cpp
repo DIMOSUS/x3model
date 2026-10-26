@@ -8,55 +8,60 @@
 #include <tuple>
 
 #include "bytes.hpp"
+#include "textlex.hpp"
 
 namespace x3::textbody {
 
 namespace {
 
-// The engine's lexer: whitespace and '/'-comments skipped, values end at ';'.
-class Lexer {
+// The engine's lexer: whitespace and '/'-comments skipped, values end at ';'; numbers through the engine's own
+// parsers (textlex.hpp), and a malformed or missing number is an error, as it is for the engine.
+class Lexer : public EngineNumbers<Lexer> {
  public:
   explicit Lexer(const std::vector<uint8_t>& d) : s_(reinterpret_cast<const char*>(d.data()), d.size()) {}
 
+  size_t p = 0;
+  bool err = false;
+  int C(size_t k = 0) const { return p + k < s_.size() ? static_cast<unsigned char>(s_[p + k]) : 0; }
+  void Comment() {
+    while (C() != '\n' && C() != 0) p++;
+  }
+
   void Skip() {
-    while (p_ < s_.size()) {
-      const char c = s_[p_];
-      if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-        p_++;
-      } else if (c == '/') {
-        while (p_ < s_.size() && s_[p_] != '\n') p_++;
-      } else {
-        break;
-      }
+    for (;;) {
+      const int c = C();
+      if (c == ' ' || c == '\t' || c == '\r' || c == '\n') p++;
+      else if (c == '/') Comment();
+      else break;
     }
   }
   bool AtEnd() {
     Skip();
-    return p_ >= s_.size() || s_[p_] == 0;
+    return C() == 0;
   }
   // a tag label ("MATERIAL6:") at the cursor; consumed if it matches
   bool Tag(const char* label) {
     Skip();
     const size_t n = strlen(label);
-    if (s_.compare(p_, n, label) != 0) return false;
-    p_ += n;
+    if (s_.compare(p, n, label) != 0) return false;
+    p += n;
     return true;
   }
   bool PeekTag(const char* label) {
     Skip();
-    return s_.compare(p_, strlen(label), label) == 0;
+    return s_.compare(p, strlen(label), label) == 0;
   }
   std::string Value() {
     Skip();
     std::string v;
-    while (p_ < s_.size() && s_[p_] != ';' && s_[p_] != 0) {
-      if (s_[p_] == '/') {  // a comment inside a value: to the end of the line
-        while (p_ < s_.size() && s_[p_] != '\n') p_++;
+    while (C() != ';' && C() != 0) {
+      if (C() == '/') {  // a comment inside a value: to the end of the line
+        Comment();
         continue;
       }
-      v += s_[p_++];
+      v += s_[p++];
     }
-    if (p_ < s_.size() && s_[p_] == ';') p_++;
+    if (C() == ';') p++;
     while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r' || v.back() == '\n')) v.pop_back();
     size_t b = 0;
     while (b < v.size() && (v[b] == ' ' || v[b] == '\t' || v[b] == '\r' || v[b] == '\n')) b++;
@@ -64,16 +69,24 @@ class Lexer {
   }
   // the next value without consuming it
   std::string PeekValue() {
-    const size_t save = p_;
+    const size_t save = p;
     std::string v = Value();
-    p_ = save;
+    p = save;
     return v;
   }
-  int64_t Int() { return ParseInt(Value()); }
-  // 16.16 from a decimal: accumulated in double, x65536, truncated (0x004ec490)
+  int64_t Int() {
+    Skip();
+    const size_t at = p;
+    const int32_t v = ParseInt();
+    if (err) throw FormatError("bad or missing integer at byte " + std::to_string(at));
+    return v;
+  }
   int32_t Fixed() {
-    const std::string v = Value();
-    return static_cast<int32_t>(static_cast<int64_t>(std::strtod(v.c_str(), nullptr) * 65536.0));
+    Skip();
+    const size_t at = p;
+    const int32_t v = ParseFixed();
+    if (err) throw FormatError("bad or missing number at byte " + std::to_string(at));
+    return v;
   }
   uint32_t Binary() {  // part / LOD flags: digit string, radix 2
     const std::string v = Value();
@@ -82,26 +95,10 @@ class Lexer {
       if (c == '0' || c == '1') r = r << 1 | static_cast<uint32_t>(c - '0');
     return r;
   }
-  static int64_t ParseInt(const std::string& v) {
-    if (v.empty() || v[0] == '#') return 0;
-    size_t i = 0;
-    bool neg = false;
-    if (v[i] == '-') neg = true, i++;
-    int64_t r = 0;
-    if (i < v.size() && v[i] == '%') {
-      for (i++; i < v.size(); i++) r = r * 2 + (v[i] == '1');
-    } else if (v.compare(i, 2, "0x") == 0 || v.compare(i, 2, "0X") == 0) {
-      r = static_cast<int64_t>(std::strtoull(v.c_str() + i + 2, nullptr, 16));
-    } else {
-      r = std::strtoll(v.c_str() + i, nullptr, 10);
-    }
-    return neg ? -r : r;
-  }
-  size_t pos() const { return p_; }
+  size_t pos() const { return p; }
 
  private:
   std::string s_;
-  size_t p_ = 0;
 };
 
 const char* kParamTypes[] = {"SPTYPE_LONG", "SPTYPE_BOOL", "SPTYPE_FLOAT", "SPTYPE_FLOAT2", "SPTYPE_FLOAT3",
@@ -179,15 +176,9 @@ double Dot(V3d a, V3d b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
 }  // namespace
 
-bool IsTextScene(const std::vector<uint8_t>& d) {
-  const std::string s(reinterpret_cast<const char*>(d.data()), std::min<size_t>(d.size(), 1 << 16));
-  if (s.find("VER:") != std::string::npos) return true;
-  size_t at = 0;
-  while ((at = s.find("\nP ", at)) != std::string::npos) {
-    if (at + 3 < s.size() && isdigit(static_cast<unsigned char>(s[at + 3]))) return true;
-    at++;
-  }
-  return s.compare(0, 2, "P ") == 0;
+bool IsTextScene(const std::vector<uint8_t>& d) {  // Scene::LoadTextCut requires "VER:" first
+  Lexer lx(d);
+  return lx.PeekTag("VER:");
 }
 
 bool IsTextBody(const std::vector<uint8_t>& d) {
@@ -241,6 +232,7 @@ bob::Body Read(const std::vector<uint8_t>& data) {
     mats.matVersion = ver;
     body.sections.push_back(mats);
   }
+  body.textMat3 = ver == 3;
   // MATERIAL3 faces name the record's index field, the others the array position
   std::map<int, int> mat3Pos;
   if (ver == 3)
@@ -276,7 +268,7 @@ bob::Body Read(const std::vector<uint8_t>& data) {
     int64_t m = 0;
     for (auto& v : verts)
       for (int32_t c : v) m = std::max<int64_t>(m, std::llabs(static_cast<int64_t>(c)));
-    if (m == 0) m = 1;
+    if (m == 0) throw FormatError("body record with all vertices at the origin (the engine refuses it)");
     for (auto& v : verts)
       for (auto& c : v) c = static_cast<int32_t>((static_cast<int64_t>(c) * 65536) / m);
 
@@ -289,6 +281,7 @@ bob::Body Read(const std::vector<uint8_t>& data) {
     std::map<std::tuple<uint32_t, int32_t, int32_t, int32_t>, std::vector<int32_t>> byKey;  // (s, pos) -> points
     std::vector<V3d> accum;
     for (;;) {
+      if (lx.AtEnd()) throw FormatError("body record ends inside its parts (no -99)");
       if (lx.PeekValue() == "-99") {  // no more parts
         lx.Value();
         lod.flags = lx.Binary();
@@ -307,6 +300,10 @@ bob::Body Read(const std::vector<uint8_t>& data) {
           corner[k] = static_cast<int32_t>(lx.Int());
         }
         if (k < 3) throw FormatError("face with fewer than 3 corners");
+        if (k == 4) {
+          const std::string tok = lx.PeekValue();
+          if (tok.empty() || tok[0] != '-') throw FormatError("face with more than 4 corners");
+        }
         const uint32_t flags = static_cast<uint32_t>(-lx.Int());
         uint32_t smooth = 0;
         if (flags & 0x10) smooth = static_cast<uint32_t>(lx.Int());

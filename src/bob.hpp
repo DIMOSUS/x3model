@@ -115,6 +115,10 @@ struct Section {
 
 struct Body {
   std::vector<Section> sections;  // in file order
+  // read from a text body with MATERIAL3 records (not stored in the binary form): the engine gives such faces the
+  // nearest global material (Material::FindNearestGlobal 0x004f71f0, by colour in its runtime table), here they get
+  // the record's array position, which a binary MAT3 body would read as a global material number
+  bool textMat3 = false;
 
   // convenience access (first section of the kind, or null)
   const Section* Find(SectionKind k) const;

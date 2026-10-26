@@ -1,11 +1,13 @@
 #include "scene.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #include "bob.hpp"
 #include "bytes.hpp"
 #include "textbody.hpp"
+#include "textlex.hpp"
 
 namespace x3::scene {
 
@@ -153,10 +155,16 @@ std::vector<uint8_t> WriteCut1(const Scene& sc) {
   for (auto& p : sc.parts) {
     w.Tag("PATH");
     w.U32(p.index);
-    if (v < 6)
-      w.I32(static_cast<int32_t>(std::strtol(p.body.c_str(), nullptr, 10)));
-    else
+    if (v < 6) {  // version < 6 stores the body as a number
+      char* end = nullptr;
+      const long id = std::strtol(p.body.c_str(), &end, 10);
+      if (p.body.empty() || *end)
+        throw FormatError("part P" + std::to_string(p.index) + ": a version " + std::to_string(v) +
+                          " scene stores body numbers, not '" + p.body + "'");
+      w.I32(static_cast<int32_t>(id));
+    } else {
       w.Str(p.body);
+    }
     w.I32(p.mode), w.I32(p.parent), w.U32(p.flags);
     if (p.name) w.Tag("NAME"), w.Str(*p.name), w.Tag("/NAM");
     if (p.constraints) {
@@ -165,12 +173,25 @@ std::vector<uint8_t> WriteCut1(const Scene& sc) {
       for (auto& [a, b] : *p.constraints) w.I32(a), w.I32(b);
       w.Tag("/CON");
     }
+    // an embedded body ends, for the engine, at the first "/BOB" after its tag: one inside the data cannot be read
+    auto embed = [&](const std::vector<uint8_t>& bytes) {
+      size_t e = std::string::npos;
+      for (size_t k = 4; k + 4 <= bytes.size() && e == std::string::npos; k++)
+        if (memcmp(bytes.data() + k, "/BOB", 4) == 0) e = k;
+      if (bytes.size() < 8 || memcmp(bytes.data(), "BOB1", 4) != 0 || e != bytes.size() - 4)
+        throw FormatError("part P" + std::to_string(p.index) +
+                          ": the embedded body is not BOB1 or has the bytes \"/BOB\" inside its data, which the engine "
+                          "takes for its end");
+      w.b.insert(w.b.end(), bytes.begin(), bytes.end());
+    };
     if (!p.embedded.empty()) {
-      w.b.insert(w.b.end(), p.embedded.begin(), p.embedded.end());
+      embed(p.embedded);
     } else if (!p.inlineText.empty()) {  // text 'L' body -> embedded BOB1
       const std::vector<uint8_t> text(p.inlineText.begin(), p.inlineText.end());
-      const auto bytes = bob::Write(textbody::Read(text));
-      w.b.insert(w.b.end(), bytes.begin(), bytes.end());
+      const bob::Body body = textbody::Read(text);
+      if (body.textMat3)
+        fprintf(stderr, "warning: part P%u: %s\n", p.index, textbody::kMat3Warning);
+      embed(bob::Write(body));
     }
     w.I32(static_cast<int32_t>(p.notes.size()));
     if (!p.notes.empty()) {
@@ -200,7 +221,7 @@ namespace {
 
 // A copy of the engine's text primitives: Body::TextSkipWhitespace 0x004e98a0, TextParseInt 0x004eb930,
 // TextParseFixed16 0x004ec490, TextReadToken 0x004e9930, TextReadCharInSet 0x004ea160. NUL ends the buffer.
-class Tr {
+class Tr : public EngineNumbers<Tr> {
  public:
   explicit Tr(const std::vector<uint8_t>& d) : d_(d) { d_.push_back(0); }
   bool err = false;
@@ -215,102 +236,6 @@ class Tr {
       if (c == 9 || c == 10 || c == 13 || c == 32) p++;
       else if (c == '/') Comment();
       else return;
-    }
-  }
-  int32_t ParseInt() {
-    int base = 0;
-    uint32_t val = 0;
-    bool neg = false;
-    for (;;) {
-      const int c = C();
-      if (c == 0 || c == ';') {
-        if (!base) return err = true, 0;
-        if (c == ';') p++;
-        return static_cast<int32_t>(neg ? 0u - val : val);
-      }
-      if (c == 9 || c == 10 || c == 13 || c == 32) { p++; continue; }
-      if (c == '#') {
-        if (base) return err = true, 0;
-        while (C() != ';' && C() != 0) p++;
-        if (C() == ';') p++;
-        return 0;
-      }
-      if (c == '%') {
-        if (base) return err = true, 0;
-        base = 2, p++;
-        continue;
-      }
-      if (c == '-') {
-        if (base || neg) return err = true, 0;
-        neg = true, p++;
-        continue;
-      }
-      if (c == '/') { Comment(); continue; }
-      if (c == '0' && base == 0 && (C(1) == 'x' || C(1) == 'X')) {
-        base = 16, p += 2;
-        continue;
-      }
-      if (base == 2) {
-        if (neg || (c != '0' && c != '1')) return err = true, 0;
-        val = val * 2 + static_cast<uint32_t>(c - '0');
-      } else if (base == 16) {
-        int d;
-        if (c >= '0' && c <= '9') d = c - '0';
-        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-        else return err = true, 0;
-        if (neg) return err = true, 0;
-        val = val * 16 + static_cast<uint32_t>(d);
-      } else {
-        if (c < '0' || c > '9') return err = true, 0;
-        base = 10;
-        val = val * 10 + static_cast<uint32_t>(c - '0');
-      }
-      p++;
-    }
-  }
-  int32_t ParseFixed() {
-    double val = 0, scale = 0;
-    bool neg = false, started = false;
-    for (;;) {
-      const int c = C();
-      if (c == 0 || c == ';') {
-        if (!started) return err = true, 0;
-        if (c == ';') p++;
-        if (neg) val = -val;
-        const double x = val * 65536.0;
-        if (!(x > -2147483649.0 && x < 2147483648.0)) return INT32_MIN;
-        return static_cast<int32_t>(x);  // _ftol: truncation toward zero
-      }
-      if (c == 9 || c == 10 || c == 13 || c == 32) { p++; continue; }
-      if (c == '#') {
-        if (started) return err = true, 0;
-        for (;;) {  // stops at the ';' (not consumed)
-          if (C() == 0) return 0;
-          p++;
-          if (C() == ';') return 0;
-        }
-      }
-      if (c == '-') {
-        if (started) return err = true, 0;
-        neg = true, p++;
-        continue;
-      }
-      if (c == '.') {
-        if (scale != 0.0) return err = true, 0;
-        scale = 1.0, p++;
-        continue;
-      }
-      if (c == '/') { Comment(); continue; }
-      if (c < '0' || c > '9') return err = true, 0;
-      started = true;
-      if (scale == 0.0) {
-        val = (static_cast<double>(c) + val * 10.0) - 48.0;
-      } else {
-        scale *= 0.1;
-        val = static_cast<double>(c - '0') * scale + val;
-      }
-      p++;
     }
   }
   std::string Token() {
@@ -374,7 +299,7 @@ Scene ReadText(const std::vector<uint8_t>& data) {
   if (r.err) throw FormatError("bad VER: value");
   static const char* kHeader = "CFENKMLTclbjfsp";
   int c = r.CharIn("P");
-  while (c == 'P' && !r.err) {
+  while (c == 'P' && !r.err && sc.parts.size() < 0x1000) {  // g_CutPartStaging holds 0x1000 parts
     Part p;
     p.index = static_cast<uint32_t>(r.I32());
     if (r.CharIn("B") != 'B') {  // the engine keeps the parts read so far
@@ -391,7 +316,7 @@ Scene ReadText(const std::vector<uint8_t>& data) {
         case 'K': {
           const int32_t n = r.I32();
           std::vector<std::pair<int32_t, int32_t>> cons;
-          for (int32_t i = 0; i < n; i++) {
+          for (int32_t i = 0; i < n && !r.err; i++) {
             const int32_t a = r.I32();
             cons.push_back({a, r.Fixed()});
           }
@@ -418,7 +343,8 @@ Scene ReadText(const std::vector<uint8_t>& data) {
           for (int i = 0; i < 9; i++) r.Fixed();  // read and discarded by the engine
           break;
         case 'N': p.name = r.String(); break;
-        case 'T': {
+        case 'T': {  // a later T replaces the notes (LoadTextCut resets the count)
+          p.notes.clear();
           int32_t v = r.I32();
           while (v != -1 && !r.err) {
             if (p.notes.size() > 99) throw FormatError("more than 100 notes");

@@ -401,6 +401,10 @@ bool Write(const std::string& path, const Scene& sc, std::string& error) {
   o.U32(7400);
   for (int i = 0; i < 120; i++) o.U8(0);
   o.Bytes(footerMagic, 16);
+  if (o.b.size() >= 0xFFFFFFFFull) {  // FBX 7.4 keeps node offsets in 32 bits
+    error = "the FBX would be 4 GB or larger";
+    return false;
+  }
 
   try {
     WriteFile(path, o.b);

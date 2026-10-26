@@ -1,7 +1,9 @@
 #include "archive.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdio>
+#include <map>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -25,6 +27,8 @@ void WriteFile(const std::string& path, const std::vector<uint8_t>& data) {
   std::ofstream f(p, std::ios::binary);
   if (!f) throw std::runtime_error("cannot write " + path);
   f.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  f.close();
+  if (!f) throw std::runtime_error("write failed: " + path);
 }
 
 std::string Game::Key(const std::string& path) {
@@ -58,7 +62,12 @@ static std::vector<std::pair<std::string, uint64_t>> ReadIndex(const std::string
     if (sp == std::string::npos) throw FormatError("bad catalogue line in " + cat + ": " + line);
     std::string path = line.substr(0, sp);
     std::replace(path.begin(), path.end(), '\\', '/');
-    out.emplace_back(path, std::stoull(line.substr(sp + 1)));
+    const std::string num = line.substr(sp + 1);
+    uint64_t size = 0;
+    const auto [end, ec] = std::from_chars(num.data(), num.data() + num.size(), size);
+    if (ec != std::errc() || end != num.data() + num.size() || num.empty())
+      throw FormatError("bad member size in " + cat + ": " + line);
+    out.emplace_back(path, size);
   }
   return out;
 }
@@ -100,6 +109,8 @@ std::vector<uint8_t> Game::ReadRaw(const CatEntry& e) const {
   f.seekg(static_cast<std::streamoff>(e.offset));
   std::vector<uint8_t> b(e.size);
   f.read(reinterpret_cast<char*>(b.data()), static_cast<std::streamsize>(e.size));
+  if (!f || static_cast<uint64_t>(f.gcount()) != e.size)
+    throw FormatError(mounts[e.mount].dat + ": member " + e.path + " is truncated");
   for (auto& c : b) c ^= 0x33;
   return b;
 }
@@ -123,6 +134,8 @@ bool Game::Find(const std::string& path, std::vector<uint8_t>& out, std::string*
 
 // ---------------------------------------------------------------- gzip
 
+static uint32_t Crc32(const std::vector<uint8_t>& d);
+
 static std::vector<uint8_t> Gunzip(const uint8_t* p, size_t n) {
   if (n < 18 || p[0] != 0x1f || p[1] != 0x8b || p[2] != 8) throw FormatError("not a gzip stream");
   const uint8_t flg = p[3];
@@ -140,6 +153,8 @@ static std::vector<uint8_t> Gunzip(const uint8_t* p, size_t n) {
   if (flg & 2) pos += 2;
   if (pos + 8 > n) throw FormatError("truncated gzip stream");
   const uint32_t isize = p[n - 4] | p[n - 3] << 8 | p[n - 2] << 16 | static_cast<uint32_t>(p[n - 1]) << 24;
+  // deflate expands at most ~1032:1; a larger ISIZE is a corrupt trailer, not a reason to allocate gigabytes
+  if (isize > (n - 8 - pos) * 1032 + 64) throw FormatError("gzip size field is impossible for the stream");
   std::vector<uint8_t> out(isize);
   ufbx_inflate_input in{};
   in.total_size = n - 8 - pos;
@@ -151,6 +166,8 @@ static std::vector<uint8_t> Gunzip(const uint8_t* p, size_t n) {
   retain.initialized = false;
   const ptrdiff_t got = ufbx_inflate(out.data(), out.size(), &in, &retain);
   if (got < 0 || static_cast<size_t>(got) != isize) throw FormatError("gzip inflate failed");
+  const uint32_t crc = p[n - 8] | p[n - 7] << 8 | p[n - 6] << 16 | static_cast<uint32_t>(p[n - 5]) << 24;
+  if (Crc32(out) != crc) throw FormatError("gzip CRC mismatch");
   return out;
 }
 
@@ -208,14 +225,24 @@ void WriteCatalog(const std::string& catPath, const std::vector<std::pair<std::s
   const fs::path dat = cat.parent_path() / (Utf8(cat.stem()) + ".dat");
   std::string index = Utf8(dat.filename()) + "\n";
   std::vector<uint8_t> data;
+  std::map<std::string, int> seen;
   for (auto& [path, bytes] : members) {
+    if (path.empty() || path.find_first_of("\r\n") != std::string::npos)
+      throw std::runtime_error("bad member path '" + path + "'");
+    if (seen[Game::Key(path)]++) throw std::runtime_error("member " + path + " given twice");
     index += path + " " + std::to_string(bytes.size()) + "\n";
     for (uint8_t c : bytes) data.push_back(c ^ 0x33);
   }
+  // the game keeps member offsets and sizes as int
+  if (data.size() >= 0x80000000u) throw std::runtime_error("catalogue data reaches 2 GB");
   std::vector<uint8_t> ib(index.begin(), index.end());
   for (size_t i = 0; i < ib.size(); i++) ib[i] ^= static_cast<uint8_t>(0xDB + i);
-  WriteFile(Utf8(cat), ib);
-  WriteFile(Utf8(dat), data);
+  // write both under temporary names, then put the .dat in place before the .cat that indexes it
+  const fs::path catTmp = Path(Utf8(cat) + ".tmp"), datTmp = Path(Utf8(dat) + ".tmp");
+  WriteFile(Utf8(datTmp), data);
+  WriteFile(Utf8(catTmp), ib);
+  fs::rename(datTmp, dat);
+  fs::rename(catTmp, cat);
 }
 
 }  // namespace x3

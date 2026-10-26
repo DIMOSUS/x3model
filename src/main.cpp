@@ -22,6 +22,12 @@
 #include "scene_fbx.hpp"
 #include "textbody.hpp"
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
 using namespace x3;
 
 namespace {
@@ -29,16 +35,18 @@ namespace {
 int Usage() {
   fprintf(stderr,
           "usage:\n"
-          "  x3model verify <game dir>      read and re-write every body of every catalogue, compare bytes\n"
-          "  x3model info <body>            print a body's sections, LODs and materials\n"
+          "  x3model verify <game dir>      read and re-write every body and scene of every catalogue, compare bytes\n"
+          "  x3model info <body>            print a body's sections, LODs and materials, or a scene's parts\n"
           "  x3model export <body> <out.fbx> [--no-textures] [--unit-mm N]\n"
-          "                                 body -> FBX (textures copied next to it when the body comes from the game)\n"
-          "  x3model import <in.fbx> <out.bob|out.pbb>   FBX -> body\n"
-          "  x3model pack <out.cat> <path inside>=<file> ...   write a catalogue (e.g. addon\\06.cat) with the files\n"
-          "  x3model roundtrip-fbx <game dir> [filter]   every body -> FBX -> body, compare bytes\n"
-          "  x3model derive-check <game dir> [filter]    recomputed tangents/bounds against the shipped ones\n"
+          "                                 body or scene -> FBX (textures copied next to it when it comes from the game)\n"
+          "  x3model import <in.fbx> <out.bob|out.pbb>   FBX -> body, or scene (CUT1) for a scene FBX\n"
+          "  x3model pack <out.cat> [--force] <path inside>=<file> ...   write a catalogue (e.g. addon\\07.cat);\n"
+          "                                 an existing catalogue is replaced only with --force\n"
+          "  x3model roundtrip-fbx <game dir> [filter]     every body -> FBX -> body, compare bytes\n"
+          "  x3model roundtrip-scenes <game dir> [filter]  every scene -> FBX -> scene, compare bytes\n"
+          "  x3model derive-check <game dir> [filter]      recomputed tangents/bounds against the shipped ones\n"
           "\n"
-          "<body> is a file (.bob/.pbb) or \"<game dir>|<path in the catalogues>\", e.g.\n"
+          "<body> is a file (.bob/.pbb/.bod/.pbd) or \"<game dir>|<path in the catalogues>\", e.g.\n"
           "  \"D:\\GAMES\\X3 Terran Conflict|objects/ships/argon/argon_M3.pbb\"\n");
   return 2;
 }
@@ -134,7 +142,8 @@ int CmdVerify(const std::string& dir) {
   }
   for (auto& [k, v] : count) printf("%-26s %d\n", k.c_str(), v);
   for (auto& [k, v] : tcount) printf("%-26s %d\n", k.c_str(), v);
-  return count.count("BOB1 DIFFERENT") ? 1 : 0;
+  // (read errors and refusals are listed, not failed on: the shipped game has a few)
+  return count.count("BOB1 DIFFERENT") || count.count("CUT1 DIFFERENT") || tcount.count("text scene: CUT1 DIFFERENT") ? 1 : 0;
 }
 
 // Loads a body or scene given as a file path, or as a path inside the game's catalogues ("game:objects/ships/x").
@@ -265,7 +274,7 @@ std::string BodyDataName(const Game& game, int id) {
   static bool loaded = false;
   if (!loaded) {
     loaded = true;
-    for (const char* path : {"types/BodyData.pck", "addon/types/BodyData.pck"}) {  // the addon's wins
+    for (const char* path : {"addon/types/BodyData.pck", "types/BodyData.pck"}) {  // the addon's table replaces the other
       std::vector<uint8_t> d;
       if (!game.Find(path, d)) continue;
       std::string text(d.begin(), d.end()), line;
@@ -285,6 +294,7 @@ std::string BodyDataName(const Game& game, int id) {
         }
         if (f.size() >= 5 && !f[4].empty()) names[atoi(f[0].c_str())] = f[4];
       }
+      break;
     }
   }
   auto it = names.find(id);
@@ -300,6 +310,15 @@ std::vector<uint8_t> LoadGameBody(const Game& game, const std::string& bodyRef) 
   if (!body.empty() && std::all_of(body.begin(), body.end(), [](char c) { return isdigit(static_cast<unsigned char>(c)); }))
     body = BodyDataName(game, atoi(body.c_str()));  // a body id
   std::replace(body.begin(), body.end(), '\\', '/');
+  // a loose file in the game folder comes before every catalogue (Archive::ResolveName), in extension order
+  for (const char* x : exts) {
+    const std::filesystem::path loose = Path(game.dir()) / Path("objects/" + body + x);
+    if (std::filesystem::is_regular_file(loose)) {
+      std::vector<uint8_t> d = Unpack(ReadFile(Utf8(loose)));
+      if (scene::IsCut1(d) || scene::IsTextScene(d)) return {};
+      return d;
+    }
+  }
   const CatEntry* best = nullptr;
   for (const char* x : exts) {
     auto it = game.winners.find(Game::Key("objects/" + body + x));
@@ -336,10 +355,20 @@ int CmdExport(const std::vector<std::string>& args) {
   std::string in, out, texDir = "textures";
   double unitMm = 1;
   for (size_t i = 0; i < args.size(); i++) {
-    if (args[i] == "--no-textures") texDir.clear();
-    else if (args[i] == "--unit-mm" && i + 1 < args.size()) unitMm = atof(args[++i].c_str());
-    else if (in.empty()) in = args[i];
-    else out = args[i];
+    if (args[i] == "--no-textures") {
+      texDir.clear();
+    } else if (args[i] == "--unit-mm") {
+      if (i + 1 >= args.size()) return Usage();
+      char* end = nullptr;
+      unitMm = strtod(args[++i].c_str(), &end);
+      if (*end || !(unitMm > 0)) throw std::runtime_error("--unit-mm needs a positive number, not " + args[i]);
+    } else if (in.empty()) {
+      in = args[i];
+    } else if (out.empty()) {
+      out = args[i];
+    } else {
+      return Usage();
+    }
   }
   if (in.empty() || out.empty()) return Usage();
   std::unique_ptr<Game> game;
@@ -459,8 +488,16 @@ int CmdRoundtripScenes(const std::string& dir, const std::string& filter) {
 // a catalogue (addon\NN.cat/.dat) holding the given files: "<path inside>=<file>"
 int CmdPack(const std::vector<std::string>& args) {
   if (args.size() < 2) return Usage();
+  const bool force = std::find(args.begin(), args.end(), "--force") != args.end();
+  {
+    const std::filesystem::path cat = Path(args[0]);
+    const std::filesystem::path dat = cat.parent_path() / (Utf8(cat.stem()) + ".dat");
+    if (!force && (std::filesystem::exists(cat) || std::filesystem::exists(dat)))
+      throw std::runtime_error(args[0] + " (or its .dat) exists: pick the next free number, or pass --force to replace it");
+  }
   std::vector<std::pair<std::string, std::vector<uint8_t>>> members;
   for (size_t i = 1; i < args.size(); i++) {
+    if (args[i] == "--force") continue;
     const size_t eq = args[i].find('=');
     if (eq == std::string::npos) throw std::runtime_error("expected <path inside>=<file>: " + args[i]);
     std::string inner = args[i].substr(0, eq);
@@ -619,7 +656,11 @@ int CmdDeriveCheck(const std::string& dir, const std::string& filter) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+// Windows hands main() its arguments in the ANSI code page; every path here is UTF-8
+int Main(int argc, const std::vector<std::string>& args) {
+  std::vector<const char*> p;
+  for (auto& a : args) p.push_back(a.c_str());
+  const char* const* argv = p.data();
   if (argc < 2) return Usage();
   const std::string cmd = argv[1];
   try {
@@ -636,4 +677,16 @@ int main(int argc, char** argv) {
     return 1;
   }
   return Usage();
+}
+
+int wmain(int argc, wchar_t** wargv) {
+  SetConsoleOutputCP(CP_UTF8);
+  std::vector<std::string> args;
+  for (int i = 0; i < argc; i++) {
+    const int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, '\0');
+    if (n > 1) WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), n, nullptr, nullptr);
+    args.push_back(std::move(s));
+  }
+  return Main(argc, args);
 }

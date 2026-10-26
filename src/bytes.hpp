@@ -22,7 +22,16 @@ class BeReader {
   void Seek(size_t p) { pos_ = p; }
   size_t size() const { return n_; }
   bool atEnd() const { return pos_ >= n_; }
+  size_t remaining() const { return pos_ < n_ ? n_ - pos_ : 0; }
   const uint8_t* data() const { return p_; }
+
+  // a record count read from the file, checked against the bytes left (each record takes at least minSize)
+  size_t Count(int64_t n, size_t minSize, const char* what) const {
+    if (n < 0) throw FormatError(std::string("negative ") + what + " count at " + std::to_string(pos_));
+    if (static_cast<uint64_t>(n) > remaining() / minSize)
+      throw FormatError(std::string(what) + " count " + std::to_string(n) + " exceeds the data at " + std::to_string(pos_));
+    return static_cast<size_t>(n);
+  }
 
   uint8_t U8() {
     Need(1);

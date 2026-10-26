@@ -15,9 +15,13 @@
 
 namespace x3::textbody {
 
-// true for a text body (not a scene): has no "VER:" scene header and no "P n;" node lines
+// true for a text body: not binary and not a text scene (one that starts with "VER:" after whitespace/comments)
 bool IsTextBody(const std::vector<uint8_t>& data);
 bool IsTextScene(const std::vector<uint8_t>& data);
 bob::Body Read(const std::vector<uint8_t>& data);
+
+inline constexpr const char* kMat3Warning =
+    "MATERIAL3 text body compiled to binary: the engine picks each face's global material by colour at load time, "
+    "the binary form here names the record's position instead - its materials will be wrong in the game";
 
 }  // namespace x3::textbody

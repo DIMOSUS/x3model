@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -42,7 +43,10 @@ inline std::vector<uint8_t> Unbase64(const std::string& s) {
   int bits = 0;
   for (char c : s) {
     const int v = val(c);
-    if (v < 0) continue;
+    if (v < 0) {
+      if (c == '=' || c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+      throw std::runtime_error(std::string("bad base64 character '") + c + "' in stored x3_* data");
+    }
     acc = acc << 6 | static_cast<uint32_t>(v);
     bits += 6;
     if (bits >= 8) {
@@ -58,7 +62,7 @@ inline void PutI32(std::vector<uint8_t>& b, int32_t v) {
   for (int s = 0; s < 32; s += 8) b.push_back(static_cast<uint8_t>(static_cast<uint32_t>(v) >> s));
 }
 inline int32_t GetI32(const std::vector<uint8_t>& b, size_t& at) {
-  if (at + 4 > b.size()) return at = b.size(), 0;
+  if (at + 4 > b.size()) throw std::runtime_error("stored x3_* data is shorter than its contents need");
   const uint32_t v = b[at] | b[at + 1] << 8 | b[at + 2] << 16 | static_cast<uint32_t>(b[at + 3]) << 24;
   at += 4;
   return static_cast<int32_t>(v);
@@ -75,6 +79,14 @@ inline std::vector<long long> SplitInts(const std::string& s) {
   long long v;
   while (in >> v) o.push_back(v);
   return o;
+}
+
+// FNV-1a over int32 values: a fingerprint of exact integer data (face corners, material numbers)
+inline uint64_t Fnv(const std::vector<int32_t>& v) {
+  uint64_t h = 1469598103934665603ull;
+  for (int32_t x : v)
+    for (int s = 0; s < 32; s += 8) h = (h ^ (static_cast<uint32_t>(x) >> s & 0xff)) * 1099511628211ull;
+  return h;
 }
 
 // shortest text that reads back to the same double

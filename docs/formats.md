@@ -118,14 +118,15 @@ part := "PATH" u32 P (version<6 ? i32 : cstr) тело i32 C i32 F u32 флаг�
 
 | где | свойства |
 |---|---|
-| корень тела | `x3_kind=body`, `x3_sections` (порядок секций), `x3_info`, `x3_name`, `x3_vers`, `x3_snd`, `x3_mat_version`, `x3_lods` |
+| корень тела | `x3_kind=body`, `x3_sections` (порядок секций), `x3_info`, `x3_name`, `x3_vers`, `x3_snd`, `x3_mat_version`, `x3_lods`, `x3_unit_mm` (мм на единицу игры), `x3_text_mat3` (текстовое тело с `MATERIAL3`) |
 | узел LOD | `x3_lod`, `x3_value` (размер/порог), `x3_flags`, `x3_points`, `x3_bones`, `x3_weights` |
-| узел части тела | `x3_part`, `x3_flags`, `x3_groups` (материал:число граней …), `x3_vertex_count`, `x3_face_count`, `x3_point_index`, `x3_point_data` (флаги и сглаживание точек), `x3_face_words`, `x3_tangents`, `x3_bounds` |
-| материал | `x3_index`, `x3_flags`, `x3_kind` (`effect`/`classic`), `x3_technique`, `x3_effect`, `x3_params` (строки «имя ТИП значения», FLOAT — десятичные), `x3_classic` |
-| корень сцены | `x3_kind=scene`, `x3_binary`, `x3_version`, `x3_info` |
+| узел части тела | `x3_part`, `x3_flags`, `x3_groups` (материал:число граней …, включая отложенные), `x3_vertex_count`, `x3_face_count` (граней в сетке), `x3_topology` (FNV-1a углов и материалов граней сетки), `x3_point_index`, `x3_point_data` (на точку 12 int32: флаги, сглаживание, позиция, нормаль, UV, UV2 — как в файле), `x3_face_words`, `x3_held_faces` (грани вне сетки: номер в списке части и три точки LOD), `x3_tangents`, `x3_bounds` |
+| материал | `x3_slot` (место в массиве тела), `x3_index`, `x3_flags`, `x3_kind` (`effect`/`classic`), `x3_technique`, `x3_effect`, `x3_params` (строки «имя ТИП значения», FLOAT — десятичные), `x3_classic` |
+| корень сцены | `x3_kind=scene`, `x3_binary`, `x3_version`, `x3_info`, `x3_unit_mm` |
 | часть сцены | `x3_part` (P), `x3_order`, `x3_body`, `x3_mode` (C), `x3_parent` (F), `x3_flags`, `x3_name`, `x3_constraints`, `x3_notes`, `x3_embedded`, `x3_inline`, `x3_keys` (все ключи как есть) |
 | геометрия тела под частью | `x3_ref` (только для показа, при импорте пропускается) |
 
-Двоичные данные хранятся в base64 (int32, little-endian). Если геометрия или анимация в FBX не совпадает с
-сохранённой, эти данные не используются и вычисляются заново. Импорт сообщает об этом построчно: какой LOD или
-какая часть пересобраны и почему.
+Двоичные данные хранятся в base64 (int32, little-endian); испорченные или короткие данные — ошибка импорта. Если
+геометрия или анимация в FBX не совпадает с сохранённой, эти данные не используются и вычисляются заново. Импорт
+сообщает об этом построчно: какой LOD или какая часть пересобраны и почему (`X3_BODY_DEBUG=1` и `X3_SCENE_DEBUG=1`
+показывают первые расхождения).

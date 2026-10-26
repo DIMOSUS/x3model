@@ -86,14 +86,13 @@ static Lod ReadLod(BeReader& r) {
   if (r.PeekTag() == "BONE") {
     r.Expect("BONE");
     l.hasBones = true;
-    const int32_t n = r.I32();
-    for (int32_t i = 0; i < n; i++) l.bones.push_back(r.Str());
+    const size_t n = r.Count(r.I32(), 1, "bone");
+    for (size_t i = 0; i < n; i++) l.bones.push_back(r.Str());
     r.Expect("/BON");
   }
   r.Expect("POIN");
   const int32_t np = r.I32();
-  if (np < 0) throw FormatError("negative point count");
-  l.points.resize(static_cast<size_t>(np));
+  l.points.resize(r.Count(np, 2, "point"));
   for (auto& p : l.points) {
     p.flags = r.U16();
     if (p.flags & kPos)
@@ -113,7 +112,7 @@ static Lod ReadLod(BeReader& r) {
     l.hasWeights = true;
     const int32_t n = r.I32();
     if (n != np) throw FormatError("WEIG count differs from the point count");
-    l.weights.resize(static_cast<size_t>(n));
+    l.weights.resize(r.Count(n, 2, "weight"));
     for (auto& w : l.weights) {
       const uint16_t k = r.U16();
       for (uint16_t j = 0; j < k; j++) {
@@ -126,26 +125,21 @@ static Lod ReadLod(BeReader& r) {
     r.Expect("/WEI");
   }
   r.Expect("PART");
-  const int32_t nParts = r.I32();
-  if (nParts < 0) throw FormatError("negative part count");
-  for (int32_t i = 0; i < nParts; i++) {
+  const size_t nParts = r.Count(r.I32(), 6, "part");
+  for (size_t i = 0; i < nParts; i++) {
     Part part;
     part.flags = r.U32();
     const uint16_t ng = r.U16();
     for (uint16_t g = 0; g < ng; g++) {
       Group grp;
       grp.material = r.I32();
-      const int32_t nf = r.I32();
-      if (nf < 0) throw FormatError("negative face count");
-      grp.faces.resize(static_cast<size_t>(nf));
+      grp.faces.resize(r.Count(r.I32(), 16, "face"));
       for (auto& f : grp.faces) {
         for (auto& v : f.v) v = r.I32();
         f.word = r.I32();
       }
       if (part.flags & kPartHasExtra) {
-        const int32_t nt = r.I32();
-        if (nt < 0) throw FormatError("negative tangent count");
-        grp.tangents.resize(static_cast<size_t>(nt));
+        grp.tangents.resize(r.Count(r.I32(), 28, "tangent"));
         for (auto& t : grp.tangents) {
           t.point = r.I32();
           for (auto& v : t.vec) v = r.I32();
@@ -181,8 +175,8 @@ Body Read(const std::vector<uint8_t>& data) {
     } else if (tag == "MAT3" || tag == "MAT5" || tag == "MAT6") {
       s.kind = SectionKind::Mat;
       s.matVersion = tag[3] - '0';
-      const int32_t n = r.I32();
-      for (int32_t i = 0; i < n; i++) s.materials.push_back(ReadMaterial(r, s.matVersion));
+      const size_t n = r.Count(r.I32(), 2, "material");
+      for (size_t i = 0; i < n; i++) s.materials.push_back(ReadMaterial(r, s.matVersion));
       r.Expect("/MAT");
     } else if (tag == "BODY") {
       s.kind = SectionKind::Body;
@@ -210,13 +204,21 @@ static void WriteMaterial(BeWriter& w, const Material& m, int ver) {
     for (auto& p : m.params) {
       w.Str(p.name);
       w.U16(p.type);
-      if (ParamValueCount(p.type) < 0)
+      const int k = ParamValueCount(p.type);
+      if (k < 0) {
         w.Str(p.str);
-      else
+      } else {
+        if (p.ints.size() != static_cast<size_t>(k))
+          throw FormatError("material " + std::to_string(m.index) + ": parameter " + p.name + " of type " +
+                            ParamTypeName(p.type) + " has " + std::to_string(p.ints.size()) + " values");
         for (int32_t v : p.ints) w.I32(v);
+      }
     }
     return;
   }
+  if (m.maps.size() != static_cast<size_t>(ver == 6 ? 5 : 3))
+    throw FormatError("material " + std::to_string(m.index) + ": a MAT" + std::to_string(ver) + " material has " +
+                      std::to_string(ver == 6 ? 5 : 3) + " map entries, not " + std::to_string(m.maps.size()));
   if (ver == 6)
     w.Str(m.texture);
   else
@@ -304,6 +306,8 @@ std::vector<uint8_t> Write(const Body& b) {
       case SectionKind::Snd: w.Tag("SND1"), w.U32(s.value), w.Tag("/SND"); break;
       case SectionKind::Mat: {
         const char tag[5] = {'M', 'A', 'T', static_cast<char>('0' + s.matVersion), 0};
+        if (s.matVersion != 3 && s.matVersion != 5 && s.matVersion != 6)
+          throw FormatError("material section version " + std::to_string(s.matVersion));
         w.Tag(tag);
         w.I32(static_cast<int32_t>(s.materials.size()));
         for (auto& m : s.materials) WriteMaterial(w, m, s.matVersion);
