@@ -17,6 +17,7 @@
 #include "bytes.hpp"
 #include "derive.hpp"
 #include "fbx_write.hpp"
+#include "scene.hpp"
 #include "textbody.hpp"
 
 using namespace x3;
@@ -61,8 +62,14 @@ int CmdVerify(const std::string& dir) {
       if (shown++ < 20) printf("%s %s: %s\n", game.mounts[e.mount].label.c_str(), e.path.c_str(), x.what());
       continue;
     }
-    if (data.size() >= 4 && memcmp(data.data(), "CUT1", 4) == 0) {
-      count["CUT1 (scene, skipped)"]++;
+    if (scene::IsCut1(data)) {
+      try {
+        const scene::Scene sc = scene::ReadCut1(data);
+        count[scene::WriteCut1(sc) == data ? "CUT1 byte-identical" : "CUT1 DIFFERENT"]++;
+      } catch (const std::exception& x) {
+        count["CUT1 read error"]++;
+        if (shown++ < 20) printf("%s %s: %s\n", game.mounts[e.mount].label.c_str(), e.path.c_str(), x.what());
+      }
       continue;
     }
     if (!bob::IsBob(data)) {
@@ -93,8 +100,25 @@ int CmdVerify(const std::string& dir) {
       tcount["text: unpack error"]++;
       continue;
     }
-    if (textbody::IsTextScene(data)) {
-      tcount["text scene (not a body)"]++;
+    if (scene::IsTextScene(data)) {
+      try {
+        const scene::Scene sc = scene::ReadText(data);
+        // text -> CUT1 -> tree must describe the same parts and keys
+        const scene::Scene back = scene::ReadCut1(scene::WriteCut1(sc));
+        bool same = back.parts.size() == sc.parts.size();
+        for (size_t i = 0; same && i < sc.parts.size(); i++) {
+          const auto &a = sc.parts[i], &b = back.parts[i];
+          same = a.index == b.index && a.body == b.body && a.mode == b.mode && a.parent == b.parent &&
+                 a.flags == b.flags && a.name == b.name && a.constraints == b.constraints && a.notes == b.notes &&
+                 a.keys.size() == b.keys.size();
+          for (size_t k = 0; same && k < a.keys.size(); k++)
+            same = a.keys[k].flags == b.keys[k].flags && a.keys[k].values == b.keys[k].values;
+        }
+        tcount[same ? "text scene read, same as CUT1" : "text scene: CUT1 DIFFERENT"]++;
+      } catch (const std::exception& x) {
+        tcount["text scene refused"]++;
+        if (shown++ < 30) printf("%s %s: %s\n", game.mounts[e.mount].label.c_str(), e.path.c_str(), x.what());
+      }
       continue;
     }
     try {

@@ -19,6 +19,7 @@ class BeReader {
   explicit BeReader(const std::vector<uint8_t>& v) : p_(v.data()), n_(v.size()) {}
 
   size_t pos() const { return pos_; }
+  void Seek(size_t p) { pos_ = p; }
   size_t size() const { return n_; }
   bool atEnd() const { return pos_ >= n_; }
   const uint8_t* data() const { return p_; }
