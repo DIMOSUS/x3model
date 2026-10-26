@@ -146,7 +146,8 @@ std::vector<uint8_t> WriteCut1(const Scene& sc) {
   BeWriter w;
   const int32_t v = sc.binary ? sc.version : 6;
   w.Tag("CUT1");
-  if (sc.info) w.Tag("INFO"), w.Str(*sc.info), w.Tag("/INF");
+  // INFO is required: Scene::LoadBinaryCut reads it first and fails without it (text scenes have none)
+  w.Tag("INFO"), w.Str(sc.info ? *sc.info : std::string("x3model")), w.Tag("/INF");
   w.I32(v);
   w.I32(static_cast<int32_t>(sc.parts.size()));
   for (auto& p : sc.parts) {

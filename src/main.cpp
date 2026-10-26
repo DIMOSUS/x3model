@@ -18,6 +18,7 @@
 #include "derive.hpp"
 #include "fbx_write.hpp"
 #include "scene.hpp"
+#include "scene_fbx.hpp"
 #include "textbody.hpp"
 
 using namespace x3;
@@ -153,6 +154,25 @@ std::vector<uint8_t> LoadInput(const std::string& spec, std::string* label) {
 int CmdInfo(const std::string& spec) {
   std::string label;
   const auto data = LoadInput(spec, &label);
+  if (scene::IsCut1(data) || scene::IsTextScene(data)) {
+    const scene::Scene sc = scene::Read(data);
+    printf("%s\n%s scene, version %d, %zu parts%s%s\n", label.c_str(), sc.binary ? "CUT1" : "text", sc.version,
+           sc.parts.size(), sc.info ? ", INFO " : "", sc.info ? sc.info->c_str() : "");
+    const char* only = getenv("X3_PART");
+    for (auto& p : sc.parts) {
+      if (only && std::to_string(p.index) != only) continue;
+      printf("  P%u body '%s' C %d F %d flags %x%s%s%s, %zu keys\n", p.index, p.body.c_str(), p.mode, p.parent, p.flags,
+             p.name ? " name " : "", p.name ? p.name->c_str() : "", p.embedded.empty() && p.inlineText.empty() ? "" : " (embedded body)",
+             p.keys.size());
+      if (only)
+        for (auto& k : p.keys) {
+          printf("    {%#x;", k.flags);
+          for (int32_t v : k.values) printf(" %d;", v);
+          printf(" }\n");
+        }
+    }
+    return 0;
+  }
   const bob::Body b = ReadAnyBody(data);
   printf("%s\n", label.c_str());
   for (auto& s : b.sections) {
@@ -236,6 +256,23 @@ bob::Body ReadAnyBody(const std::vector<uint8_t>& data) {
   throw FormatError("not a body (a scene?)");
 }
 
+// A scene part's body ("ships\argon\argon_M3"): objects/<name> with the engine's extension order; among the
+// catalogues the highest one holding the stem wins, then pbb > bob > pbd > bod inside it.
+std::vector<uint8_t> LoadGameBody(const Game& game, const std::string& body) {
+  static const char* exts[] = {".pbb", ".bob", ".pbd", ".bod"};
+  const CatEntry* best = nullptr;
+  for (const char* x : exts) {
+    auto it = game.winners.find(Game::Key("objects/" + body + x));
+    if (it == game.winners.end()) continue;
+    const CatEntry& e = game.entries[it->second];
+    if (!best || e.mount > best->mount) best = &e;
+  }
+  if (!best) return {};
+  std::vector<uint8_t> d = game.Read(*best);
+  if (scene::IsCut1(d) || scene::IsTextScene(d)) return {};  // a nested scene, not a body
+  return d;
+}
+
 std::string Stem(const std::string& path) {
   std::string b = TextureBase(path);
   const size_t dot = b.rfind('.');
@@ -270,12 +307,19 @@ int CmdExport(const std::vector<std::string>& args) {
   if (bar != std::string::npos) game = std::make_unique<Game>(in.substr(0, bar));
   std::string label;
   const auto data = LoadInput(in, &label);
-  const bob::Body body = ReadAnyBody(data);
   ExportOptions opt;
   opt.unitCm = unitMm / 10.0;
   opt.textureDir = game ? texDir : "";
   std::vector<std::pair<std::string, std::string>> textures;
-  fbx::Scene sc = BodyToFbx(body, Stem(out), opt, &textures);
+  fbx::Scene sc;
+  if (scene::IsCut1(data) || scene::IsTextScene(data)) {
+    const scene::Scene s = scene::Read(data);
+    BodyLoader loader;
+    if (game) loader = [&](const std::string& body) { return LoadGameBody(*game, body); };
+    sc = SceneToFbx(s, Stem(out), opt, loader, &textures);
+  } else {
+    sc = BodyToFbx(ReadAnyBody(data), Stem(out), opt, &textures);
+  }
   const std::filesystem::path outDir = Path(out).parent_path();
   int copied = 0, missing = 0;
   for (auto& [stem, rel] : textures) {
@@ -303,6 +347,17 @@ int CmdExport(const std::vector<std::string>& args) {
 }
 
 int CmdImport(const std::string& in, const std::string& out) {
+  if (FbxIsScene(in)) {
+    SceneImportReport rep;
+    const scene::Scene sc = FbxToScene(in, rep);
+    std::vector<uint8_t> bytes = scene::WriteCut1(sc);
+    if (EndsWith(out, ".pbb")) bytes = PackGzip(bytes);
+    WriteFile(out, bytes);
+    printf("%s -> %s: scene, %d parts (%d with their stored keys, %d rebuilt, %d new)\n", in.c_str(), out.c_str(),
+           rep.parts, rep.keptKeys, rep.rebuiltKeys, rep.newParts);
+    for (auto& n : rep.notes) printf("  %s\n", n.c_str());
+    return 0;
+  }
   ImportReport rep;
   const bob::Body body = FbxToBody(in, rep);
   std::vector<uint8_t> bytes = bob::Write(body);
@@ -312,6 +367,53 @@ int CmdImport(const std::string& in, const std::string& out) {
          rep.points, rep.faces, rep.exact ? "stored data used (unedited)" : "derived data recomputed (edited)");
   for (auto& n : rep.notes) printf("  %s\n", n.c_str());
   return 0;
+}
+
+// every scene of the game: scene -> FBX -> scene, compare the CUT1 bytes
+int CmdRoundtripScenes(const std::string& dir, const std::string& filter) {
+  Game game(dir);
+  const std::filesystem::path tmp = std::filesystem::temp_directory_path() / "x3model_rt_scene.fbx";
+  std::map<std::string, int> count;
+  int shown = 0;
+  for (auto& [key, idx] : game.winners) {
+    const CatEntry& e = game.entries[idx];
+    if (!EndsWith(e.path, ".pbb") && !EndsWith(e.path, ".bob") && !EndsWith(e.path, ".pbd") && !EndsWith(e.path, ".bod")) continue;
+    if (!filter.empty() && key.find(Game::Key(filter)) == std::string::npos) continue;
+    std::vector<uint8_t> data;
+    try {
+      data = game.Read(e);
+    } catch (...) {
+      continue;
+    }
+    if (!scene::IsCut1(data) && !scene::IsTextScene(data)) continue;
+    try {
+      const scene::Scene sc = scene::Read(data);
+      const auto want = scene::WriteCut1(sc);
+      ExportOptions opt;
+      const fbx::Scene f = SceneToFbx(sc, Stem(e.path), opt, nullptr, nullptr);
+      std::string err;
+      if (!fbx::Write(Utf8(tmp), f, err)) throw std::runtime_error(err);
+      SceneImportReport rep;
+      const auto got = scene::WriteCut1(FbxToScene(Utf8(tmp), rep));
+      if (got == want) {
+        count["identical"]++;
+      } else {
+        count["DIFFERENT"]++;
+        if (shown++ < 15) {
+          size_t at = 0;
+          while (at < got.size() && at < want.size() && got[at] == want[at]) at++;
+          printf("%s: differs at byte %zu of %zu/%zu (%d parts rebuilt)", e.path.c_str(), at, want.size(), got.size(), rep.rebuiltKeys);
+          if (!rep.notes.empty()) printf(" - %s", rep.notes[0].c_str());
+          printf("\n");
+        }
+      }
+    } catch (const std::exception& x) {
+      count["error"]++;
+      if (shown++ < 15) printf("%s: %s\n", e.path.c_str(), x.what());
+    }
+  }
+  for (auto& [k, v] : count) printf("%-12s %d\n", k.c_str(), v);
+  return count.size() == 1 && count.count("identical") ? 0 : 1;
 }
 
 // a catalogue (addon\NN.cat/.dat) holding the given files: "<path inside>=<file>"
@@ -485,6 +587,7 @@ int main(int argc, char** argv) {
     if (cmd == "info" && argc == 3) return CmdInfo(argv[2]);
     if (cmd == "export") return CmdExport(std::vector<std::string>(argv + 2, argv + argc));
     if (cmd == "import" && argc == 4) return CmdImport(argv[2], argv[3]);
+    if (cmd == "roundtrip-scenes" && argc >= 3) return CmdRoundtripScenes(argv[2], argc > 3 ? argv[3] : "");
     if (cmd == "pack") return CmdPack(std::vector<std::string>(argv + 2, argv + argc));
     if (cmd == "roundtrip-fbx" && argc >= 3) return CmdRoundtripFbx(argv[2], argc > 3 ? argv[3] : "");
     if (cmd == "derive-check" && argc >= 3) return CmdDeriveCheck(argv[2], argc > 3 ? argv[3] : "");
