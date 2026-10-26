@@ -19,10 +19,11 @@ namespace {
 
 constexpr double kFix = 65536.0;
 
-// The game is left-handed (Direct3D), FBX right-handed: Z is negated both ways. Mirroring one axis also mirrors the
-// winding, and the game's front faces are clockwise (CullMode CCW), so after the mirror they are counter-clockwise,
-// which is FBX's front: the index order stays as it is.
+// The game is left-handed (Direct3D), FBX right-handed: Z is negated both ways. With the mirror, the game's corner
+// order (a, b, c) faces away from the stored normals in FBX terms (measured in Blender: 10645 of 10647 faces of
+// argon_M3 against their normals), so faces are written (a, c, b) and read back the same way.
 inline double Mirror(int axis, double v) { return axis == 2 ? -v : v; }
+constexpr int kCorner[3] = {0, 2, 1};  // FBX corner k = game corner kCorner[k] (its own inverse)
 
 // Positions are stored normalised (the largest coordinate about 65536) and the LOD 0 value is the object's size,
 // so one stored unit is value/65536 game units. A body with a non-positive LOD 0 value (one broken shipped asset)
@@ -299,7 +300,10 @@ fbx::Scene BodyToFbx(const bob::Body& body, const std::string& name, const Expor
         groups += (groups.empty() ? "" : " ") + std::to_string(g.material) + ":" + std::to_string(g.faces.size());
         const int slot = g.material >= 0 && static_cast<size_t>(g.material) < sc.materials.size() ? g.material : 0;
         for (auto& f : g.faces) {
-          for (int32_t v : f.v) mesh.triangles.push_back(v >= 0 && static_cast<size_t>(v) < localOf.size() ? localOf[v] : 0);
+          for (int k = 0; k < 3; k++) {
+            const int32_t v = f.v[kCorner[k]];
+            mesh.triangles.push_back(v >= 0 && static_cast<size_t>(v) < localOf.size() ? localOf[v] : 0);
+          }
           mesh.triangleMaterial.push_back(slot);
           PutI32(faceWords, f.word);
           wordsAllOne &= f.word == 1;
@@ -698,9 +702,11 @@ bob::Body FbxToBody(const std::string& fbxPath, ImportReport& rep) {
         }
         if (total != static_cast<long long>(g.tris.size())) runs.clear();
       }
+      // game corner k of a triangle = FBX corner kCorner[k]
       auto pointOf = [&](size_t tri, int k) -> int32_t {
-        if (exact) return partPointOf[gi][g.tris[tri][k].cp];
-        return partPointOf[gi][tri * 3 + k];
+        const int c = kCorner[k];
+        if (exact) return partPointOf[gi][g.tris[tri][c].cp];
+        return partPointOf[gi][tri * 3 + c];
       };
       if (!runs.empty()) {
         size_t t = 0;

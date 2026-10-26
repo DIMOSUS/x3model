@@ -324,6 +324,36 @@ int CmdDeriveCheck(const std::string& dir, const std::string& filter) {
         bob::Part d = part;
         DeriveBounds(lod, d);
         DeriveTangents(lod, d);
+        if (getenv("X3_DERIVE_DUMP") && parts == 1) {
+          printf("%s\n  bounds stored :", e.path.c_str());
+          for (int32_t v : part.bounds) printf(" %d", v);
+          printf("\n  bounds derived:");
+          for (int32_t v : d.bounds) printf(" %d", v);
+          printf("\n");
+          const auto& a = part.groups[0].tangents;
+          std::map<int32_t, const bob::TangentRecord*> mine;
+          for (auto& r : d.groups[0].tangents) mine[r.point] = &r;
+          for (size_t i = 0; i < a.size() && i < 8; i++) {
+            const bob::Point& p = lod.points[a[i].point];
+            printf("  rec %zu point %d n(%d %d %d) uv(%d %d)\n    stored  T(%d %d %d) B(%d %d %d)\n", i, a[i].point,
+                   p.normal[0], p.normal[1], p.normal[2], p.uv[0], p.uv[1], a[i].vec[0], a[i].vec[1], a[i].vec[2],
+                   a[i].vec[3], a[i].vec[4], a[i].vec[5]);
+            if (auto* m = mine[a[i].point])
+              printf("    derived T(%d %d %d) B(%d %d %d)\n", m->vec[0], m->vec[1], m->vec[2], m->vec[3], m->vec[4], m->vec[5]);
+          }
+          for (size_t fi = 0; fi < 3 && fi < part.groups[0].faces.size(); fi++) {
+            const auto& f = part.groups[0].faces[fi];
+            printf("  face %zu:", fi);
+            for (int32_t v : f.v) {
+              const bob::Point& p = lod.points[v];
+              printf(" [%d pos %d %d %d uv %d %d]", v, p.pos[0], p.pos[1], p.pos[2], p.uv[0], p.uv[1]);
+            }
+            printf("\n");
+          }
+          printf("  stored order:");
+          for (size_t i = 0; i < a.size() && i < 30; i++) printf(" %d", a[i].point);
+          printf("\n");
+        }
         boundsEqual += d.bounds == part.bounds;
         for (int k = 0; k < 10; k++) boundsField[k] += d.bounds[k] == part.bounds[k];
         for (size_t gi = 0; gi < part.groups.size(); gi++) {

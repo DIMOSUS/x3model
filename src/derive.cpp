@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 
 namespace x3 {
@@ -47,6 +48,10 @@ void DeriveTangents(const bob::Lod& lod, bob::Part& part) {
       const V3 b = (e2 * du1 - e1 * du2) * r;
       for (int k = 0; k < 3; k++) tan[f.v[k]] = tan[f.v[k]] + t, bin[f.v[k]] = bin[f.v[k]] + b;
     }
+  // Conventions of the shipped records (measured against the 3ds Max exporter's output, derive-check): one record
+  // per point of the group, in the order points first appear in the group's faces; the first vector is the
+  // direction of increasing u made orthogonal to the point normal, the second about the direction of decreasing v.
+  // The exporter's exact averaging is not reproduced (the vectors agree in direction, not to the last unit).
   for (auto& g : part.groups) {
     g.tangents.clear();
     std::vector<char> seen(n, 0);
@@ -54,14 +59,14 @@ void DeriveTangents(const bob::Lod& lod, bob::Part& part) {
     for (auto& f : g.faces)
       for (int32_t v : f.v)
         if (v >= 0 && static_cast<size_t>(v) < n && !seen[v]) seen[v] = 1, pts.push_back(v);
-    std::sort(pts.begin(), pts.end());
     for (int32_t v : pts) {
       const bob::Point& p = lod.points[v];
       const V3 nrm = Norm({p.normal[0] / 65536.0, p.normal[1] / 65536.0, p.normal[2] / 65536.0});
       V3 t = Norm(tan[v] - nrm * Dot(nrm, tan[v]));
       if (Dot(t, t) == 0) t = Norm(Cross(std::fabs(nrm.y) < 0.9 ? V3{0, 1, 0} : V3{1, 0, 0}, nrm));
-      V3 b = Norm(bin[v] - nrm * Dot(nrm, bin[v]) - t * Dot(t, bin[v]));
-      if (Dot(b, b) == 0) b = Cross(nrm, t);
+      const V3 down = bin[v] * -1.0;
+      V3 b = Norm(down - nrm * Dot(nrm, down));
+      if (Dot(b, b) == 0) b = Cross(t, nrm);
       bob::TangentRecord rec;
       rec.point = v;
       rec.vec[0] = Fix(t.x), rec.vec[1] = Fix(t.y), rec.vec[2] = Fix(t.z);
@@ -78,23 +83,34 @@ void DeriveBounds(const bob::Lod& lod, bob::Part& part) {
     for (auto& f : g.faces)
       for (int32_t v : f.v)
         if (v >= 0 && static_cast<size_t>(v) < n) used[v] = 1;
-  long long sum[3] = {0, 0, 0}, count = 0;
   int32_t mn[3] = {INT32_MAX, INT32_MAX, INT32_MAX}, mx[3] = {INT32_MIN, INT32_MIN, INT32_MIN};
+  bool any = false;
   for (size_t v = 0; v < n; v++) {
     if (!used[v]) continue;
-    count++;
+    any = true;
     for (int k = 0; k < 3; k++) {
-      sum[k] += lod.points[v].pos[k];
       mn[k] = std::min(mn[k], lod.points[v].pos[k]);
       mx[k] = std::max(mx[k], lod.points[v].pos[k]);
     }
   }
-  if (!count) {
+  if (!any) {
     part.bounds.fill(0);
     return;
   }
+  // centre: integer mean of the face corners (truncated). Against the shipped parts (derive-check over ships/,
+  // 1774 parts): centre x/y/z equal in 1451/1234/1163, AABB fields in 1280..1595; the rest differ by rounding of
+  // the exporter's own arithmetic. Mean of distinct points, rounded, floored or area-weighted centroids match less.
+  long long s[3] = {0, 0, 0}, corners = 0;
+  for (auto& g : part.groups)
+    for (auto& f : g.faces)
+      for (int32_t v : f.v)
+        if (v >= 0 && static_cast<size_t>(v) < n) {
+          corners++;
+          for (int k = 0; k < 3; k++) s[k] += lod.points[v].pos[k];
+        }
   int32_t c[3];
-  for (int k = 0; k < 3; k++) c[k] = static_cast<int32_t>(sum[k] / count);
+  for (int k = 0; k < 3; k++) c[k] = static_cast<int32_t>(s[k] / corners);
+  // radius: largest coordinate distance (L-infinity) from the centre
   long long r = 0;
   for (size_t v = 0; v < n; v++)
     if (used[v])
