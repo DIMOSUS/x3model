@@ -1,0 +1,6 @@
+ufbx - from https://github.com/ufbx/ufbx (tag v0.23.1, commit 26a482ae66871d7de36eb722aa060bce95bce274), downloaded
+2026-10-14:
+  ufbx.h, ufbx.c (FBX loader: binary and ASCII, every version; triangulation, normals, UV sets, materials, textures),
+  LICENSE (MIT, or the Unlicense - the author offers both; we take MIT).
+Used as it is by src/ufbx_impl.cpp (compiled as C++). The model dumps ([d3d11] model_dump, src/model_files.cpp) read
+every FBX they write back through it as a check; the user models' import (FBX -> our own mesh format) will load with it.

@@ -1,0 +1,4 @@
+build/
+*.fbx
+out/
+__pycache__/
