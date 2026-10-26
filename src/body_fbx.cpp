@@ -579,11 +579,15 @@ bob::Body FbxToBody(const std::string& fbxPath, ImportReport& rep) {
     auto toInt = [](double v) { return static_cast<int32_t>(std::llround(v)); };
     // points: exact path = every control point has one attribute set and the stored data matches in count
     bool exact = storedPoints >= 0;
+    std::string why = exact ? "" : "no stored point count";
     for (auto& g : geos) {
       const ufbx_props& pp = g.node->props;
-      if (PropInt(pp, "x3_vertex_count", -1) != g.cpCount ||
-          PropInt(pp, "x3_face_count", -1) != static_cast<long long>(g.tris.size()))
-        exact = false;
+      if (PropInt(pp, "x3_vertex_count", -1) != g.cpCount)
+        exact = false, why = Str(g.node->name) + ": " + std::to_string(g.cpCount) + " vertices, stored " +
+                              std::to_string(PropInt(pp, "x3_vertex_count", -1));
+      else if (PropInt(pp, "x3_face_count", -1) != static_cast<long long>(g.tris.size()))
+        exact = false, why = Str(g.node->name) + ": " + std::to_string(g.tris.size()) + " triangles, stored " +
+                              std::to_string(PropInt(pp, "x3_face_count", -1));
     }
     lod.points.clear();
     std::vector<std::vector<int32_t>> partPointOf(geos.size());  // per part: control point -> LOD point
@@ -603,22 +607,35 @@ bob::Body FbxToBody(const std::string& fbxPath, ImportReport& rep) {
         }
         const auto pd = Unbase64(PropStr(pp, "x3_point_data"));
         if (pd.size() != static_cast<size_t>(g.cpCount) * 8) {
-          exact = false;
+          exact = false, why = Str(g.node->name) + ": stored point data does not match the vertices";
           break;
         }
         // one attribute set per control point
         std::vector<const Corner*> seen(g.cpCount, nullptr);
         for (auto& t : g.tris)
           for (auto& c : t) {
+            if (!exact) break;
             const Corner*& s = seen[c.cp];
             if (!s) {
               s = &c;
               continue;
             }
+            // equal up to the DCC's own precision: positions and UVs within float32 rounding; normals within 1e-3
+            // of their length (Blender keeps custom normals in its own encoding, about 1e-4 off; some shipped
+            // normals are far from unit length)
+            auto near = [](double a, double b) { return std::fabs(a - b) <= std::max(2.0, std::fabs(a) * 2e-6); };
+            const double nlen = std::sqrt(s->nrm[0] * s->nrm[0] + s->nrm[1] * s->nrm[1] + s->nrm[2] * s->nrm[2]);
             for (int k = 0; k < 3 && exact; k++)
-              exact = toInt(s->nrm[k] * kFix) == toInt(c.nrm[k] * kFix) && toInt(s->pos[k] / scale) == toInt(c.pos[k] / scale);
+              exact = std::fabs(s->nrm[k] - c.nrm[k]) <= std::max(1e-3 * nlen, 2.0 / kFix) &&
+                      near(s->pos[k] / scale, c.pos[k] / scale);
             for (int k = 0; k < 2 && exact; k++)
-              exact = toInt(s->uv[k] * kFix) == toInt(c.uv[k] * kFix) && toInt(s->uv2[k] * kFix) == toInt(c.uv2[k] * kFix);
+              exact = near(s->uv[k] * kFix, c.uv[k] * kFix) && near(s->uv2[k] * kFix, c.uv2[k] * kFix);
+            if (!exact) {
+              char b[256];
+              snprintf(b, sizeof b, " (n %.6g %.6g %.6g / %.6g %.6g %.6g, uv %.6g %.6g / %.6g %.6g)", s->nrm[0],
+                       s->nrm[1], s->nrm[2], c.nrm[0], c.nrm[1], c.nrm[2], s->uv[0], s->uv[1], c.uv[0], c.uv[1]);
+              why = Str(g.node->name) + ": vertex " + std::to_string(c.cp) + " has different normals/UVs per face" + b;
+            }
           }
         if (!exact) break;
         size_t at = 0;
@@ -644,10 +661,12 @@ bob::Body FbxToBody(const std::string& fbxPath, ImportReport& rep) {
         }
         partPointOf[gi] = globalOf;
       }
-      for (size_t i = 0; exact && i < filled.size(); i++) exact = filled[i] != 0;
+      for (size_t i = 0; exact && i < filled.size(); i++)
+        if (!filled[i]) exact = false, why = "point " + std::to_string(i) + " belongs to no part";
     }
     if (!exact) {
       rep.exact = false;
+      rep.notes.push_back("LOD " + std::to_string(lodIndex) + ": rebuilt from the geometry (" + why + ")");
       lod.points.clear();
       // generic: a point per distinct (control point, normal, uv, uv2), parts after each other
       for (size_t gi = 0; gi < geos.size(); gi++) {
