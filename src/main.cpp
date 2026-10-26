@@ -10,6 +10,7 @@
 #include <cmath>
 #include <filesystem>
 #include <memory>
+#include <sstream>
 
 #include "archive.hpp"
 #include "bob.hpp"
@@ -258,8 +259,47 @@ bob::Body ReadAnyBody(const std::vector<uint8_t>& data) {
 
 // A scene part's body ("ships\argon\argon_M3"): objects/<name> with the engine's extension order; among the
 // catalogues the highest one holding the stem wins, then pbb > bob > pbd > bod inside it.
-std::vector<uint8_t> LoadGameBody(const Game& game, const std::string& body) {
+// types/BodyData: "id; shadow; collision; explosion; filename;" (filename blank: v\%05d)
+std::string BodyDataName(const Game& game, int id) {
+  static std::map<int, std::string> names;
+  static bool loaded = false;
+  if (!loaded) {
+    loaded = true;
+    for (const char* path : {"types/BodyData.pck", "addon/types/BodyData.pck"}) {  // the addon's wins
+      std::vector<uint8_t> d;
+      if (!game.Find(path, d)) continue;
+      std::string text(d.begin(), d.end()), line;
+      std::istringstream in(text);
+      while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '/') continue;
+        std::vector<std::string> f;
+        size_t at = 0;
+        while (at <= line.size()) {
+          const size_t e = line.find(';', at);
+          std::string v = line.substr(at, e == std::string::npos ? std::string::npos : e - at);
+          while (!v.empty() && (v.back() == ' ' || v.back() == '\r')) v.pop_back();
+          while (!v.empty() && v[0] == ' ') v.erase(0, 1);
+          f.push_back(v);
+          if (e == std::string::npos) break;
+          at = e + 1;
+        }
+        if (f.size() >= 5 && !f[4].empty()) names[atoi(f[0].c_str())] = f[4];
+      }
+    }
+  }
+  auto it = names.find(id);
+  if (it != names.end()) return it->second;
+  char b[16];
+  snprintf(b, sizeof b, "v\\%05d", id);
+  return b;
+}
+
+std::vector<uint8_t> LoadGameBody(const Game& game, const std::string& bodyRef) {
   static const char* exts[] = {".pbb", ".bob", ".pbd", ".bod"};
+  std::string body = bodyRef;
+  if (!body.empty() && std::all_of(body.begin(), body.end(), [](char c) { return isdigit(static_cast<unsigned char>(c)); }))
+    body = BodyDataName(game, atoi(body.c_str()));  // a body id
+  std::replace(body.begin(), body.end(), '\\', '/');
   const CatEntry* best = nullptr;
   for (const char* x : exts) {
     auto it = game.winners.find(Game::Key("objects/" + body + x));

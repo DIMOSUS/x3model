@@ -35,16 +35,17 @@ Q Normalised(Q q) {
 
 // The game is left-handed and FBX right-handed (Z mirrored). A rotation R of the game becomes M R M in FBX
 // (M = diag(1, 1, -1)); for a quaternion that negates x and y. Whether the engine applies its key rotation to row
-// vectors (the Direct3D habit: the effective rotation is the transpose) is settled by the scene check in the docs
-// ("Scenes", rotation convention): kRowVectors.
-constexpr bool kRowVectors = true;
+// vectors (the Direct3D habit: the effective rotation is the transpose) was settled on the scene
+// stations/docks/dock9portsscene: with row vectors its five docking arms point at the hub in a regular five-fold
+// pattern, with column vectors they scatter (docs/formats.md, "Scenes").
+constexpr bool RowVectors() { return true; }
 Q GameToFbx(Q q) {
-  if (kRowVectors) q = {q.w, -q.x, -q.y, -q.z};  // effective rotation = transpose = conjugate
+  if (RowVectors()) q = {q.w, -q.x, -q.y, -q.z};  // effective rotation = transpose = conjugate
   return {q.w, -q.x, -q.y, q.z};
 }
 Q FbxToGame(Q q) {
   q = {q.w, -q.x, -q.y, q.z};
-  if (kRowVectors) q = {q.w, -q.x, -q.y, -q.z};
+  if (RowVectors()) q = {q.w, -q.x, -q.y, -q.z};
   return q;
 }
 
