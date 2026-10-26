@@ -368,27 +368,51 @@ void CollectMeshNodes(ufbx_node* n, std::vector<ufbx_node*>& out) {
   for (size_t i = 0; i < n->children.count; i++) CollectMeshNodes(n->children.data[i], out);
 }
 
+// A material for an FBX material without x3_* data: standard_lighting.fx with the parameter list of a shipped
+// standard_lighting material (objects/stations/Cadius/USC/Headquarters/solar_panels.pbb, material 1), opaque and
+// back-face culled, textures taken from the FBX channels by file stem (the game resolves dds/<stem>).
 bob::Material DefaultEffectMaterial(const ufbx_material* um, uint16_t index) {
+  static const char* kTemplate =
+      "diffcompression BOOL 0\nbumpcompression BOOL 0\nspeccompression BOOL 0\nlightcompression BOOL 0\n"
+      "nofiltering BOOL 0\nautofree BOOL 0\nTex2 BOOL 0\nTexAnimStartU FLOAT 0\nTexAnimStartV FLOAT 0\n"
+      "TexAnimEndU FLOAT 0\nTexAnimEndV FLOAT 0\nTexAnimDuration FLOAT 0\nTexAnimRotation FLOAT 0\n"
+      "TexAnimOriginU FLOAT 0.5\nTexAnimOriginV FLOAT 0.5\nBrightness FLOAT 1\ncontrast FLOAT 1\nsaturation FLOAT 1\n"
+      "hue FLOAT 0\ncolormatrix BOOL 0\ng_ColorWriteEnable LONG 15\ng_Wrap LONG 0\ng_CullMode LONG 3\n"
+      "g_AlphaBlendEnable LONG 0\ng_BlendOp LONG 1\ng_SrcBlend LONG 2\ng_DestBlend LONG 1\ng_ZEnable LONG 1\n"
+      "g_ZWriteEnable LONG 1\ng_ALPHATESTENABLE LONG 0\ng_LightAmbientIntensity FLOAT4 0 0 0 0\nLightDir_Dir0 LONG 0\n"
+      "LightDir_Color0 FLOAT4 1 1 1 0\nLightDir_Dir1 LONG 0\nLightDir_Color1 FLOAT4 0 0 0 0\n"
+      "g_MatSpecularStrength FLOAT 2\ng_MatSpecularPower FLOAT 80\ng_MatReflectionStrength FLOAT 1\n"
+      "g_MatReflectionBias FLOAT 1\ng_MatReflectionBlur FLOAT 0\ng_AlphaValue FLOAT 1\n"
+      "g_MatEmissiveColor FLOAT4 0 0 0 0\nt_FilterTypeDiffuse LONG 2\nt_SamplerAddressMode LONG 1\n"
+      "t_SamplerMaxAnisotropy LONG 4\nt_MipMapLODBias FLOAT 0\nt_DiffuseTexture STRING NULL\n"
+      "t_MinFilterTypeDiffuse LONG 3\ng_MatDiffuseStrength FLOAT 0.29998779296875\nt_AlphaTexture STRING NULL\n"
+      "t_BumpTexture STRING NULL\nt_MinFilterTypeBump LONG 3\nt_BumpMipMapLODBias FLOAT 0\nt_FilterTypeBump LONG 2\n"
+      "t_SpecularTexture STRING NULL\nt_LightMapTexture STRING NULL\n"
+      "t_CubeMapTexture STRING effects\\others\\envmap_test.dds\n";
   bob::Material m;
   m.index = index;
   m.flags = 0x02000000;
   m.technique = 1;
   m.effect = "standard_lighting.fx";
-  auto add = [&](const char* name, uint16_t type, int32_t v) {
-    bob::EffectParam p;
-    p.name = name, p.type = type, p.ints = {v};
-    m.params.push_back(p);
+  m.params = ParseParams(kTemplate);
+  auto texOf = [&](const ufbx_material_map& map) -> std::string {
+    if (!map.texture) return "";
+    std::string base = TextureBase(Str(map.texture->relative_filename.length ? map.texture->relative_filename
+                                                                             : map.texture->filename));
+    const size_t dot = base.rfind('.');
+    return dot == std::string::npos ? base : base.substr(0, dot);
   };
-  auto addStr = [&](const char* name, const std::string& v) {
-    bob::EffectParam p;
-    p.name = name, p.type = bob::kString, p.str = v;
-    m.params.push_back(p);
-  };
-  add("g_EnableFog", bob::kBool, 0);
-  std::string diff;
-  if (um && um->fbx.diffuse_color.texture) diff = TextureBase(Str(um->fbx.diffuse_color.texture->filename));
-  addStr("t_DiffuseTexture", diff);
-  addStr("effectfile", "standard_lighting.fx");
+  if (um) {
+    const std::pair<const char*, const ufbx_material_map*> maps[] = {
+        {"t_DiffuseTexture", &um->fbx.diffuse_color}, {"t_BumpTexture", &um->fbx.normal_map},
+        {"t_SpecularTexture", &um->fbx.specular_color}, {"t_LightMapTexture", &um->fbx.emission_color}};
+    for (auto& [name, map] : maps) {
+      const std::string t = texOf(*map);
+      if (t.empty()) continue;
+      for (auto& p : m.params)
+        if (p.name == name) p.str = t;
+    }
+  }
   return m;
 }
 

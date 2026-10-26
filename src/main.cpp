@@ -31,6 +31,7 @@ int Usage() {
           "  x3model export <body> <out.fbx> [--no-textures] [--unit-mm N]\n"
           "                                 body -> FBX (textures copied next to it when the body comes from the game)\n"
           "  x3model import <in.fbx> <out.bob|out.pbb>   FBX -> body\n"
+          "  x3model pack <out.cat> <path inside>=<file> ...   write a catalogue (e.g. addon\\06.cat) with the files\n"
           "  x3model roundtrip-fbx <game dir> [filter]   every body -> FBX -> body, compare bytes\n"
           "  x3model derive-check <game dir> [filter]    recomputed tangents/bounds against the shipped ones\n"
           "\n"
@@ -145,6 +146,14 @@ int CmdInfo(const std::string& spec) {
             for (auto& p : m.params)
               if (p.type == bob::kString && !p.str.empty()) printf(" %s=%s", p.name.c_str(), p.str.c_str());
             printf("\n");
+            if (getenv("X3_PARAMS"))
+              for (auto& p : m.params) {
+                printf("      %s %s", p.name.c_str(), bob::ParamTypeName(p.type));
+                if (p.type == bob::kString) printf(" %s", p.str.c_str());
+                else
+                  for (int32_t v : p.ints) printf(" %d", v);
+                printf("\n");
+              }
           } else {
             printf("  %u classic tex '%s' flags %08x\n", m.index, m.texture.c_str(), m.flags);
           }
@@ -278,6 +287,23 @@ int CmdImport(const std::string& in, const std::string& out) {
   printf("%s -> %s: %d LOD, %d parts, %d points, %d faces; %s\n", in.c_str(), out.c_str(), rep.lods, rep.parts,
          rep.points, rep.faces, rep.exact ? "stored data used (unedited)" : "derived data recomputed (edited)");
   for (auto& n : rep.notes) printf("  %s\n", n.c_str());
+  return 0;
+}
+
+// a catalogue (addon\NN.cat/.dat) holding the given files: "<path inside>=<file>"
+int CmdPack(const std::vector<std::string>& args) {
+  if (args.size() < 2) return Usage();
+  std::vector<std::pair<std::string, std::vector<uint8_t>>> members;
+  for (size_t i = 1; i < args.size(); i++) {
+    const size_t eq = args[i].find('=');
+    if (eq == std::string::npos) throw std::runtime_error("expected <path inside>=<file>: " + args[i]);
+    std::string inner = args[i].substr(0, eq);
+    std::replace(inner.begin(), inner.end(), '\\', '/');
+    members.push_back({inner, ReadFile(args[i].substr(eq + 1))});
+    printf("  %s (%zu bytes)\n", inner.c_str(), members.back().second.size());
+  }
+  WriteCatalog(args[0], members);
+  printf("%s: %zu members\n", args[0].c_str(), members.size());
   return 0;
 }
 
@@ -435,6 +461,7 @@ int main(int argc, char** argv) {
     if (cmd == "info" && argc == 3) return CmdInfo(argv[2]);
     if (cmd == "export") return CmdExport(std::vector<std::string>(argv + 2, argv + argc));
     if (cmd == "import" && argc == 4) return CmdImport(argv[2], argv[3]);
+    if (cmd == "pack") return CmdPack(std::vector<std::string>(argv + 2, argv + argc));
     if (cmd == "roundtrip-fbx" && argc >= 3) return CmdRoundtripFbx(argv[2], argc > 3 ? argv[3] : "");
     if (cmd == "derive-check" && argc >= 3) return CmdDeriveCheck(argv[2], argc > 3 ? argv[3] : "");
   } catch (const std::exception& x) {
