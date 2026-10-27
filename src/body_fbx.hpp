@@ -22,6 +22,7 @@ struct ExportOptions {
   std::string textureDir;        // textures referenced relative to the .fbx in this folder ("" = not referenced)
   const Game* game = nullptr;    // to copy the textures out of the catalogues
   std::string outDir;            // where the .fbx goes (for the texture copies)
+  double bakeFps = 0;            // scenes: > 0 samples the engine's motion between keys at this rate (preview)
 };
 
 // body -> FBX scene; name is the body's file stem; textures to copy are added to *textures as (game path, out path)

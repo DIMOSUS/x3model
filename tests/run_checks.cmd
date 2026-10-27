@@ -13,3 +13,5 @@ echo == roundtrip-scenes (expected: identical 949, error 2: the two text scenes 
 "%X%" roundtrip-scenes "%GAME%"
 echo == roundtrip-scenes --perturb (expected: edited parts 2882, as expected 2882)
 "%X%" roundtrip-scenes "%GAME%" --perturb
+echo == roundtrip-scenes --bake (expected: identical 949, error 2)
+"%X%" roundtrip-scenes "%GAME%" --bake

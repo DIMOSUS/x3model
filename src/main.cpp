@@ -38,7 +38,7 @@ int Usage() {
           "usage:\n"
           "  x3model verify <game dir>      read and re-write every body and scene of every catalogue, compare bytes\n"
           "  x3model info <body>            print a body's sections, LODs and materials, or a scene's parts\n"
-          "  x3model export <body> <out.fbx> [--no-textures] [--unit-mm N]\n"
+          "  x3model export <body> <out.fbx> [--no-textures] [--unit-mm N] [--bake-anim [fps]]\n"
           "                                 body or scene -> FBX (textures copied next to it when it comes from the game)\n"
           "  x3model import <in.fbx> <out.bob|out.pbb>   FBX -> body, or scene (CUT1) for a scene FBX\n"
           "  x3model pack <out.cat> [--force] <path inside>=<file> ...   write a catalogue (e.g. addon\\07.cat);\n"
@@ -354,10 +354,14 @@ bool FindTexture(const Game& game, const std::string& stem, std::vector<uint8_t>
 
 int CmdExport(const std::vector<std::string>& args) {
   std::string in, out, texDir = "textures";
-  double unitMm = 1;
+  double unitMm = 1, bakeFps = 0;
   for (size_t i = 0; i < args.size(); i++) {
     if (args[i] == "--no-textures") {
       texDir.clear();
+    } else if (args[i] == "--bake-anim") {
+      bakeFps = 30;
+      if (i + 1 < args.size() && isdigit(static_cast<unsigned char>(args[i + 1][0]))) bakeFps = atof(args[++i].c_str());
+      if (!(bakeFps > 0)) throw std::runtime_error("--bake-anim needs a positive frame rate");
     } else if (args[i] == "--unit-mm") {
       if (i + 1 >= args.size()) return Usage();
       char* end = nullptr;
@@ -379,6 +383,7 @@ int CmdExport(const std::vector<std::string>& args) {
   const auto data = LoadInput(in, &label);
   ExportOptions opt;
   opt.unitCm = unitMm / 10.0;
+  opt.bakeFps = bakeFps;
   opt.textureDir = game ? texDir : "";
   std::vector<std::pair<std::string, std::string>> textures;
   fbx::Scene sc;
@@ -540,7 +545,7 @@ std::string CheckPerturbed(const scene::Part& before, const scene::Part& after, 
 }
 
 // every scene of the game: scene -> FBX -> scene, compare the CUT1 bytes
-int CmdRoundtripScenes(const std::string& dir, const std::string& filter, bool perturb) {
+int CmdRoundtripScenes(const std::string& dir, const std::string& filter, bool perturb, bool bake) {
   Game game(dir);
   const std::filesystem::path tmp = std::filesystem::temp_directory_path() / "x3model_rt_scene.fbx";
   std::map<std::string, int> count;
@@ -561,6 +566,7 @@ int CmdRoundtripScenes(const std::string& dir, const std::string& filter, bool p
       const scene::Scene sc = scene::Read(data);
       const auto want = scene::WriteCut1(sc);
       ExportOptions opt;
+      if (bake) opt.bakeFps = 30;
       fbx::Scene f = SceneToFbx(sc, Stem(e.path), opt, nullptr, nullptr);
       std::vector<std::pair<size_t, int>> edits;
       if (perturb) {
@@ -817,9 +823,13 @@ int Main(int argc, const std::vector<std::string>& args) {
     if (cmd == "import" && argc == 4) return CmdImport(argv[2], argv[3]);
     if (cmd == "roundtrip-scenes" && argc >= 3) {
       std::string filter;
-      bool perturb = false;
-      for (int i = 3; i < argc; i++) (strcmp(argv[i], "--perturb") == 0 ? perturb = true : (filter = argv[i], false));
-      return CmdRoundtripScenes(argv[2], filter, perturb);
+      bool perturb = false, bake = false;
+      for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--perturb") == 0) perturb = true;
+        else if (strcmp(argv[i], "--bake") == 0) bake = true;
+        else filter = argv[i];
+      }
+      return CmdRoundtripScenes(argv[2], filter, perturb, bake);
     }
     if (cmd == "anim-sample" && argc >= 3) return CmdAnimSample(argv[2], argc > 3 ? atoi(argv[3]) : 100);
     if (cmd == "pack") return CmdPack(std::vector<std::string>(argv + 2, argv + argc));

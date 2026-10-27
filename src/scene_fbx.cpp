@@ -223,6 +223,43 @@ ExportedAnim ExportAnim(const std::vector<Pose>& poses, const std::vector<int64_
   return a;
 }
 
+// The baked form (export --bake-anim, a preview: DCCs show FBX keys linearly): the keys, plus between them samples
+// at fps of the engine's motion (TCB, squad, camera targets) from the engine evaluator.
+ExportedAnim BakeAnim(const scene::Part& p, const std::vector<Pose>& poses, const std::vector<int64_t>& keyTimes, double fps) {
+  ExportedAnim a = ExportAnim(poses, keyTimes);
+  if (!a.moves || fps <= 0) return a;
+  const anim::Tracks tr = anim::Build(p);
+  const int64_t end = anim::Length(tr);
+  ExportedAnim b = a;
+  b.time.clear(), b.t.clear(), b.e.clear();
+  size_t j = 0;
+  double prev[3] = {a.restE[0], a.restE[1], a.restE[2]};
+  auto add = [&](double s, const double t[3], double e[3]) {
+    for (int k = 0; k < 3; k++) {
+      while (e[k] - prev[k] > 180) e[k] -= 360;
+      while (e[k] - prev[k] < -180) e[k] += 360;
+      prev[k] = e[k];
+    }
+    b.time.push_back(s), b.t.push_back({t[0], t[1], t[2]}), b.e.push_back({e[0], e[1], e[2]});
+  };
+  for (int64_t f = 0;; f++) {
+    const double s = f / fps;
+    // the keys up to this sample, as exported
+    for (; j < a.time.size() && a.time[j] <= s + 1e-6; j++) {
+      double e[3] = {a.e[j][0], a.e[j][1], a.e[j][2]};
+      add(a.time[j], a.t[j].data(), e);
+    }
+    if (s * 1000 > end) break;
+    if (!b.time.empty() && std::fabs(b.time.back() - s) < 1e-6) continue;
+    const anim::State st = anim::Evaluate(tr, std::llround(s * 1000));
+    double t[3] = {0, 0, 0}, e[3];
+    if (st.pos) t[0] = (*st.pos)[0], t[1] = (*st.pos)[1], t[2] = -double((*st.pos)[2]);
+    QuatToEuler(GameToFbx(st.m ? MatrixQuat(*st.m) : Q{}), e);
+    add(s, t, e);
+  }
+  return b;
+}
+
 std::string KeysBlob(const scene::Part& p) {
   std::vector<uint8_t> b;
   PutI32(b, static_cast<int32_t>(p.keys.size()));
@@ -267,6 +304,7 @@ fbx::Scene SceneToFbx(const scene::Scene& sc, const std::string& name, const Exp
   root.props.push_back(fbx::Prop::Int("x3_version", sc.version));
   if (sc.info) root.props.push_back(fbx::Prop::Str("x3_info", *sc.info));
   root.props.push_back(fbx::Prop::Dbl("x3_unit_mm", opt.unitCm * 10));
+  if (opt.bakeFps > 0) root.props.push_back(fbx::Prop::Dbl("x3_bake_fps", opt.bakeFps));
   out.nodes.push_back(root);
 
   std::map<uint32_t, int> nodeOfPart;
@@ -307,7 +345,7 @@ fbx::Scene SceneToFbx(const scene::Scene& sc, const std::string& name, const Exp
     n.props.push_back(fbx::Prop::Str("x3_keys", KeysBlob(p)));
 
     // rest pose, and every key a curve key when the part moves
-    const ExportedAnim anim = ExportAnim(KeyPoses(p), scene::KeyTimes(p));
+    const ExportedAnim anim = BakeAnim(p, KeyPoses(p), scene::KeyTimes(p), opt.bakeFps);
     for (int k = 0; k < 3; k++) n.translation[k] = anim.restT[k], n.rotation[k] = anim.restE[k];
     for (size_t i = 0; i < anim.time.size(); i++) {
       for (int k = 0; k < 3; k++) {
@@ -482,13 +520,13 @@ struct MergeResult {
 };
 MergeResult MergeKeys(const std::vector<scene::Key>& stored, const std::function<ufbx_transform(double)>& at,
                       const std::vector<double>& fbxTimes, const std::array<std::vector<double>, 6>& channels,
-                      double frame, bool needKey, bool fromBlender) {
+                      double frame, bool needKey, bool fromBlender, double bakeFps) {
   scene::Part probe;
   probe.keys = stored;
   const auto poses = KeyPoses(probe);
   const auto times = scene::KeyTimes(probe);
   const auto eq = EngineQuats(probe);
-  const ExportedAnim exported = ExportAnim(poses, times);
+  const ExportedAnim exported = BakeAnim(probe, poses, times, bakeFps);
   bool ordered = true;
   for (size_t i = 1; i < times.size(); i++) ordered &= times[i] >= times[i - 1];
 
@@ -619,10 +657,12 @@ MergeResult MergeKeys(const std::vector<scene::Key>& stored, const std::function
       bool near = false;
       for (auto& k : ks) near |= std::llabs(k.ms - ms) <= tol;
       if (near) continue;
+      const ufbx_transform f = at(t);
+      // a baked export: the samples between keys are the engine's motion; where the FBX still shows them, no key
+      if (bakeFps > 0 && exported.moves && shows(t, f)) continue;
       std::vector<Pose> ps;
       std::vector<int64_t> ts;
       for (auto& k : ks) ps.push_back(k.pose), ts.push_back(k.ms);
-      const ufbx_transform f = at(t);
       // (no keys at all: the engine's pose is the origin; a new part gets its key at 0 anyway)
       if (!ks.empty() || !(needKey && t == 0.0)) {
         const ExportedAnim sofar = ExportAnim(ps, ts);
@@ -846,6 +886,8 @@ scene::Scene FbxToScene(const std::string& path, SceneImportReport& rep) {
     if (up->value_real > 0) unitMm = up->value_real;
   const double frame = s->settings.frames_per_second > 0 ? 1.0 / s->settings.frames_per_second : 1.0 / 30;
   StackCache stacks;
+  double bakeFps = 0;
+  if (const ufbx_prop* bp = ufbx_find_prop(&root->props, "x3_bake_fps")) bakeFps = bp->value_real;
   const bool fromBlender = s->metadata.exporter == UFBX_EXPORTER_BLENDER_BINARY || s->metadata.exporter == UFBX_EXPORTER_BLENDER_ASCII;
   if (getenv("X3_SCENE_DEBUG")) rep.notes.push_back(std::string("written by Blender: ") + (fromBlender ? "yes" : "no"));
   if (getenv("X3_SCENE_DEBUG"))
@@ -956,7 +998,8 @@ scene::Scene FbxToScene(const std::string& path, SceneImportReport& rep) {
         rep.notes.push_back("part P" + std::to_string(p.index) + ": x3_keys does not decode, keys taken from the FBX");
       }
     }
-    const MergeResult merged = MergeKeys(stored, at, fbxTimes, ChannelTimes(s, n, stacks), frame, !it.stored, fromBlender);
+    const MergeResult merged =
+        MergeKeys(stored, at, fbxTimes, ChannelTimes(s, n, stacks), frame, !it.stored, fromBlender, bakeFps);
     p.keys = merged.keys;
     // a camera's target node (x3_target_of): its position at each target key is the key's target
     int targetsMoved = 0;
