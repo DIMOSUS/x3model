@@ -44,11 +44,14 @@ int Usage() {
           "  x3model pack <out.cat> [--force] <path inside>=<file> ...   write a catalogue (e.g. addon\\07.cat);\n"
           "                                 an existing catalogue is replaced only with --force\n"
           "  x3model roundtrip-fbx <game dir> [filter]     every body -> FBX -> body, compare bytes\n"
-          "  x3model roundtrip-scenes <game dir> [filter]  every scene -> FBX -> scene, compare bytes\n"
+          "  x3model roundtrip-scenes <game dir> [filter] [--perturb] [--bake]\n"
+          "                                 every scene -> FBX -> scene, compare bytes (--perturb: edit one key per\n"
+          "                                 animated part and check only it changed; --bake: through a baked FBX)\n"
           "  x3model derive-check <game dir> [filter]      recomputed tangents/bounds against the shipped ones\n"
+          "  x3model anim-sample <scene> [step ms]         every part's motion from the engine evaluator\n"
           "\n"
           "<body> is a file (.bob/.pbb/.bod/.pbd) or \"<game dir>|<path in the catalogues>\", e.g.\n"
-          "  \"D:\\GAMES\\X3 Terran Conflict|objects/ships/argon/argon_M3.pbb\"\n");
+          "  \"C:\\Games\\X3 Terran Conflict|objects/ships/argon/argon_M3.pbb\"\n");
   return 2;
 }
 

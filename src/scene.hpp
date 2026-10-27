@@ -1,8 +1,8 @@
 #pragma once
 // Scenes: binary CUT1 (.bob/.pbb starting with "CUT1") and text scenes (.bod/.pbd starting with "VER:"), read into
 // one tree, written as CUT1. Layout and engine semantics: docs/formats.md, "Scenes" (from Scene::LoadBinaryCut
-// 0x00490ec0, Scene::LoadTextCut 0x00491b10, Scene::ReadCutKeyframes 0x00490650; reference implementation
-// RETools projects/x3ap/model/x3scene.py).
+// 0x00490ec0, Scene::LoadTextCut 0x00491b10, Scene::ReadCutKeyframes 0x00490650; full description
+// docs/scene_format.md, reference implementation tools/x3scene.py).
 //
 //   CUT1 := "CUT1" "INFO" cstr "/INF" i32 version i32 nParts part*n "/CUT"
 //   part := "PATH" u32 index (version < 6 ? i32 body : cstr body) i32 mode(C) i32 parent(F) u32 flags

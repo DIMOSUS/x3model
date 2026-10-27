@@ -1,7 +1,6 @@
 #pragma once
 // A writer of binary FBX 7.4 (the format Blender, 3ds Max and Maya read; ufbx reads it back). Grown from the
-// MW4M model dump writer (mw4hook src/fbx_write.cpp): the same node encoding, extended with a node hierarchy,
-// two UV sets, per-polygon materials, several texture channels per material, user properties (Properties70
+// author's earlier model dump writer: the same node encoding, extended with a node hierarchy, two UV sets, per-polygon materials, several texture channels per material, user properties (Properties70
 // entries flagged "U", which Blender imports as custom properties) and animation curves.
 //
 // Conventions of what this writer produces: right-handed, Y up, Z front; lengths in the file's unit, declared by

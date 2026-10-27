@@ -1,7 +1,7 @@
 #pragma once
 // The engine's animation of a scene part, as Scene::AnimateNode 0x0048dc20 computes it from the tracks that
-// Scene::CommitCutArrays 0x004901a0 prepares (RETools projects/x3ap/model/scene_format.md section 9; a C++ copy of the
-// reference evaluate_tracks() in x3scene.py): positions linear or Hermite with Kochanek-Bartels tangents and the TCB
+// Scene::CommitCutArrays 0x004901a0 prepares (docs/scene_format.md section 9; a C++ copy of the reference
+// evaluate_tracks() in tools/x3scene.py): positions linear or Hermite with Kochanek-Bartels tangents and the TCB
 // ease curve, rotations slerp or squad, camera targets with a roll track, all in 16.16 fixed point. The engine's
 // x87 steps are done in doubles, so a value can be 1/65536 off in rare cases.
 #include <array>

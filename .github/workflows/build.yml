@@ -1,0 +1,24 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: cmd
+        run: build.cmd
+      - name: Smoke test
+        shell: cmd
+        run: |
+          build\x3model.exe
+          if %ERRORLEVEL% neq 2 exit /b 1
+          exit /b 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x3model
+          path: build/x3model.exe
