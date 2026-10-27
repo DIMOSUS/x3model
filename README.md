@@ -19,6 +19,11 @@ targets.
 **Status.** The FBX round trip is checked over the whole game and through Blender 5.2. **Edited models and scenes have
 not been tried in the game yet** — reports are welcome.
 
+## Download
+
+The ready exe: [Releases](https://github.com/DIMOSUS/x3model/releases/latest) → `x3model.zip` (x3model.exe with the
+README, license and documents). Windows x64, no installation: unpack and run `x3model.exe` from a command prompt.
+
 ## Build
 
 Windows, Visual Studio 2019 or later with the "Desktop development with C++" workload (it brings CMake and Ninja).
@@ -26,8 +31,8 @@ Windows, Visual Studio 2019 or later with the "Desktop development with C++" wor
 build.cmd
 ```
 The result is `build\x3model.exe`. No external libraries: FBX is read with the bundled [ufbx](third_party/ufbx) and
-written by an own binary FBX 7.4 writer (`src/fbx_write.cpp`); gzip is inflated by ufbx too. CI builds the exe (the
-Actions tab, artifact `x3model`).
+written by an own binary FBX 7.4 writer (`src/fbx_write.cpp`); gzip is inflated by ufbx too. CI builds every push; a tag `v*`
+publishes a release with `x3model.zip`.
 
 ## Commands
 

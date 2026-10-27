@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: write  # a tag v* publishes a release with the exe
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -18,7 +21,21 @@ jobs:
           build\x3model.exe
           if %ERRORLEVEL% neq 2 exit /b 1
           exit /b 0
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist/x3model | Out-Null
+          Copy-Item build/x3model.exe, README.md, README.ru.md, LICENSE dist/x3model/
+          Copy-Item docs dist/x3model/docs -Recurse
+          Copy-Item tools dist/x3model/tools -Recurse
+          Compress-Archive dist/x3model/* dist/x3model.zip
       - uses: actions/upload-artifact@v4
         with:
           name: x3model
-          path: build/x3model.exe
+          path: dist/x3model.zip
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/x3model.zip --title "x3model ${{ github.ref_name }}" --generate-notes

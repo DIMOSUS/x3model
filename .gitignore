@@ -2,3 +2,4 @@ build/
 *.fbx
 out/
 __pycache__/
+dist/
