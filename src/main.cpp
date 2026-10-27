@@ -438,11 +438,70 @@ int CmdImport(const std::string& in, const std::string& out) {
   return 0;
 }
 
+// --perturb: in every animated part with 3+ keys the middle FBX key is edited (even parts: x + 100; odd parts:
+// Euler Y + 10 degrees); after import that key must show the edit, every other key its old pose, nothing added
+struct PerturbStats {
+  int parts = 0, ok = 0, keysSame = 0, keysReencoded = 0;
+};
+// the FBX node of each part (by x3_order; body geometry nodes sit between them)
+std::vector<size_t> PartNodes(const fbx::Scene& f, size_t parts) {
+  std::vector<size_t> out(parts, 0);
+  for (size_t i = 0; i < f.nodes.size(); i++)
+    for (auto& p : f.nodes[i].props)
+      if (p.name == "x3_order" && p.i >= 0 && static_cast<size_t>(p.i) < parts) out[p.i] = i;
+  return out;
+}
+void PerturbAndCheck(const scene::Scene& sc, fbx::Scene& f, std::vector<std::pair<size_t, int>>& edits) {
+  const auto nodeOf = PartNodes(f, sc.parts.size());
+  for (size_t pi = 0; pi < sc.parts.size(); pi++) {
+    fbx::Node& n = f.nodes[nodeOf[pi]];
+    const auto& tt = n.animT[0].time;
+    if (tt.size() < 3) continue;
+    const size_t mid = tt.size() / 2;
+    if (tt[mid] == tt[mid - 1] || tt[mid] == tt[mid + 1]) continue;
+    int kind = static_cast<int>(edits.size() % 2);
+    if (sc.parts[pi].keys[mid].flags & 8) kind = 0;  // target mode: the rotation comes from the target
+    if (kind == 0) n.animT[0].value[mid] += 100;
+    else n.animR[1].value[mid] += 10;
+    edits.push_back({pi, kind});
+  }
+}
+std::string CheckPerturbed(const scene::Part& before, const scene::Part& after, int kind, const fbx::Node& n, PerturbStats& st) {
+  if (after.keys.size() != before.keys.size())
+    return std::to_string(before.keys.size()) + " keys became " + std::to_string(after.keys.size());
+  const size_t mid = n.animT[0].time.size() / 2;
+  const auto a = KeyPosesFbx(before), b = KeyPosesFbx(after);
+  for (size_t j = 0; j < a.size(); j++) {
+    std::array<double, 7> want = a[j];
+    if (j == mid && kind == 0) want[0] += 100;
+    if (j == mid && kind == 1) {
+      const double e[3] = {n.animR[0].value[mid], n.animR[1].value[mid], n.animR[2].value[mid]};
+      const auto q = EulerQuat(e);
+      for (int k = 0; k < 4; k++) want[3 + k] = q[k];
+    }
+    for (int k = 0; k < 3; k++)
+      if (std::fabs(want[k] - b[j][k]) > std::max(0.5, std::fabs(want[k]) * 1.2e-7)) {  // (FBX curves are float32)
+        char m[200];
+        snprintf(m, sizeof m, "key %zu of %zu (mid %zu) position %.1f %.1f %.1f, want %.1f %.1f %.1f, flags %#x->%#x", j,
+                 a.size(), mid, b[j][0], b[j][1], b[j][2], want[0], want[1], want[2], before.keys[j].flags, after.keys[j].flags);
+        return m;
+      }
+    const double dot = want[3] * b[j][3] + want[4] * b[j][4] + want[5] * b[j][5] + want[6] * b[j][6];
+    if (std::fabs(dot) < 1 - 1e-8) return "key " + std::to_string(j) + " rotation off (dot " + std::to_string(dot) + ")";
+    if (j != mid) {
+      if (after.keys[j].flags == before.keys[j].flags && after.keys[j].values == before.keys[j].values) st.keysSame++;
+      else st.keysReencoded++;
+    }
+  }
+  return "";
+}
+
 // every scene of the game: scene -> FBX -> scene, compare the CUT1 bytes
-int CmdRoundtripScenes(const std::string& dir, const std::string& filter) {
+int CmdRoundtripScenes(const std::string& dir, const std::string& filter, bool perturb) {
   Game game(dir);
   const std::filesystem::path tmp = std::filesystem::temp_directory_path() / "x3model_rt_scene.fbx";
   std::map<std::string, int> count;
+  PerturbStats pst;
   int shown = 0;
   for (auto& [key, idx] : game.winners) {
     const CatEntry& e = game.entries[idx];
@@ -459,11 +518,27 @@ int CmdRoundtripScenes(const std::string& dir, const std::string& filter) {
       const scene::Scene sc = scene::Read(data);
       const auto want = scene::WriteCut1(sc);
       ExportOptions opt;
-      const fbx::Scene f = SceneToFbx(sc, Stem(e.path), opt, nullptr, nullptr);
+      fbx::Scene f = SceneToFbx(sc, Stem(e.path), opt, nullptr, nullptr);
+      std::vector<std::pair<size_t, int>> edits;
+      if (perturb) {
+        PerturbAndCheck(sc, f, edits);
+        if (edits.empty()) continue;
+      }
       std::string err;
       if (!fbx::Write(Utf8(tmp), f, err)) throw std::runtime_error(err);
       SceneImportReport rep;
-      const auto got = scene::WriteCut1(FbxToScene(Utf8(tmp), rep));
+      const scene::Scene back = FbxToScene(Utf8(tmp), rep);
+      if (perturb) {
+        const auto nodeOf = PartNodes(f, sc.parts.size());
+        for (auto& [pi, kind] : edits) {
+          pst.parts++;
+          const std::string why = CheckPerturbed(sc.parts[pi], back.parts[pi], kind, f.nodes[nodeOf[pi]], pst);
+          if (why.empty()) pst.ok++;
+          else if (shown++ < 15) printf("%s P%u (%s): %s\n", e.path.c_str(), sc.parts[pi].index, kind ? "rotation" : "position", why.c_str());
+        }
+        continue;
+      }
+      const auto got = scene::WriteCut1(back);
       if (got == want) {
         count["identical"]++;
       } else {
@@ -480,6 +555,11 @@ int CmdRoundtripScenes(const std::string& dir, const std::string& filter) {
       count["error"]++;
       if (shown++ < 15) printf("%s: %s\n", e.path.c_str(), x.what());
     }
+  }
+  if (perturb) {
+    printf("edited parts %d, as expected %d; other keys byte-identical %d, re-encoded (same pose) %d\n", pst.parts,
+           pst.ok, pst.keysSame, pst.keysReencoded);
+    return pst.ok == pst.parts ? 0 : 1;
   }
   for (auto& [k, v] : count) printf("%-12s %d\n", k.c_str(), v);
   return count.size() == 1 && count.count("identical") ? 0 : 1;
@@ -668,7 +748,12 @@ int Main(int argc, const std::vector<std::string>& args) {
     if (cmd == "info" && argc == 3) return CmdInfo(argv[2]);
     if (cmd == "export") return CmdExport(std::vector<std::string>(argv + 2, argv + argc));
     if (cmd == "import" && argc == 4) return CmdImport(argv[2], argv[3]);
-    if (cmd == "roundtrip-scenes" && argc >= 3) return CmdRoundtripScenes(argv[2], argc > 3 ? argv[3] : "");
+    if (cmd == "roundtrip-scenes" && argc >= 3) {
+      std::string filter;
+      bool perturb = false;
+      for (int i = 3; i < argc; i++) (strcmp(argv[i], "--perturb") == 0 ? perturb = true : (filter = argv[i], false));
+      return CmdRoundtripScenes(argv[2], filter, perturb);
+    }
     if (cmd == "pack") return CmdPack(std::vector<std::string>(argv + 2, argv + argc));
     if (cmd == "roundtrip-fbx" && argc >= 3) return CmdRoundtripFbx(argv[2], argc > 3 ? argv[3] : "");
     if (cmd == "derive-check" && argc >= 3) return CmdDeriveCheck(argv[2], argc > 3 ? argv[3] : "");

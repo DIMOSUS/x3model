@@ -6,8 +6,9 @@
 // The referenced bodies' LOD 0 geometry is added under each part as child mesh nodes marked x3_ref (shared between
 // parts using the same body), so the scene can be seen and placed; those nodes are ignored on import. Everything
 // needed to write the scene back exactly (part fields, raw keys) is kept in x3_* user properties; a part whose FBX
-// transform and animation are unchanged gets its stored keys back, an edited one gets keys rebuilt from the FBX
-// (absolute axis-angle keys).
+// transform and animation are unchanged gets its stored keys back; for an edited one the keys are merged one by one:
+// unchanged keys stay, changed ones take the FBX pose in their own form, FBX keys between them become new keys.
+#include <array>
 #include <functional>
 #include <string>
 #include <vector>
@@ -31,5 +32,10 @@ scene::Scene FbxToScene(const std::string& fbxPath, SceneImportReport& report);
 
 // true if the FBX holds a scene (a node with x3_kind = scene)
 bool FbxIsScene(const std::string& fbxPath);
+
+// for tests: per key, the pose the engine reaches there in FBX space (translation; rotation as w, x, y, z), and an
+// FBX Euler XYZ rotation (degrees) as w, x, y, z
+std::vector<std::array<double, 7>> KeyPosesFbx(const scene::Part& part);
+std::array<double, 4> EulerQuat(const double euler[3]);
 
 }  // namespace x3

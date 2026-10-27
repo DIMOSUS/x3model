@@ -74,38 +74,36 @@ void QuatToEuler(Q q, double out[3]) {
 // Per key: the engine's rotation quaternion (Scene::BuildRotationKeyQuats: axis-angle keys, axis stored negated,
 // half angle from the 16-bit turn, composed with the previous key unless flag 0x2000), or the previous one for keys
 // of another kind. Three-angle keys (no flag 2) are taken as yaw (Y), pitch (X), roll (Z) - an inference.
+// one key applied to the rotation accumulated so far: the rotation after this key
+Q StepRotation(const Q& run, const scene::Key& k) {
+  const uint32_t f = k.flags;
+  if (f & 8) return run;  // target mode: the rotation comes from the target
+  Q q;
+  if (f & 2) {
+    if (!(f & 0x20)) {
+      const double ax = -k.Get("ax") / kFix, ay = -k.Get("ay") / kFix, az = -k.Get("az") / kFix;
+      if (ax != 0 || ay != 0 || az != 0) {
+        const double h = ((k.Get("angle") / 2) & 0xffff) / kFix * 2 * kPi;  // half angle, 16-bit turns
+        const double s = std::sin(h);
+        q = {std::cos(h), ax * s, ay * s, az * s};
+      }
+    }
+    if (!(f & 0x2000)) q = Mul(run, q);
+  } else if (!(f & 0x20) && !(f & 0x200) && k.Has("yaw")) {
+    auto turn = [](int32_t v) { return (v & 0xffff) / kFix * 2 * kPi; };
+    const double a = turn(k.Get("yaw")), b = turn(k.Get("pitch")), c = turn(k.Get("roll3"));
+    const Q qy{std::cos(a / 2), 0, std::sin(a / 2), 0}, qx{std::cos(b / 2), std::sin(b / 2), 0, 0},
+        qz{std::cos(c / 2), 0, 0, std::sin(c / 2)};
+    q = Mul(Mul(qy, qx), qz);
+  } else {
+    q = run;
+  }
+  return q;
+}
 std::vector<Q> EngineQuats(const scene::Part& p) {
   std::vector<Q> out;
   Q run;
-  for (auto& k : p.keys) {
-    const uint32_t f = k.flags;
-    if (f & 8) {
-      out.push_back(run);
-      continue;
-    }
-    Q q;
-    if (f & 2) {
-      if (!(f & 0x20)) {
-        const double ax = -k.Get("ax") / kFix, ay = -k.Get("ay") / kFix, az = -k.Get("az") / kFix;
-        if (ax != 0 || ay != 0 || az != 0) {
-          const double h = ((k.Get("angle") / 2) & 0xffff) / kFix * 2 * kPi;  // half angle, 16-bit turns
-          const double s = std::sin(h);
-          q = {std::cos(h), ax * s, ay * s, az * s};
-        }
-      }
-      if (!(f & 0x2000)) q = Mul(run, q);
-    } else if (!(f & 0x20) && !(f & 0x200) && k.Has("yaw")) {
-      auto turn = [](int32_t v) { return (v & 0xffff) / kFix * 2 * kPi; };
-      const double a = turn(k.Get("yaw")), b = turn(k.Get("pitch")), c = turn(k.Get("roll3"));
-      const Q qy{std::cos(a / 2), 0, std::sin(a / 2), 0}, qx{std::cos(b / 2), std::sin(b / 2), 0, 0},
-          qz{std::cos(c / 2), 0, 0, std::sin(c / 2)};
-      q = Mul(Mul(qy, qx), qz);
-    } else {
-      q = run;
-    }
-    run = q;
-    out.push_back(q);
-  }
+  for (auto& k : p.keys) out.push_back(run = StepRotation(run, k));
   return out;
 }
 
@@ -361,20 +359,342 @@ ufbx_scene* Load(const std::string& path) {
   return s;
 }
 
-bool Close(const Pose& a, const ufbx_transform& b) {
+// slackT / slackA: extra tolerance in game units (per axis) / radians (motion within the timing error of a DCC that
+// bakes, the error of its curve simplification)
+bool Close(const Pose& a, const ufbx_transform& b, const double* slackT, double slackA) {
+  // FBX curve values are float32: far from the origin (some planet scenes reach 1e8) a step is several units
   for (int k = 0; k < 3; k++)
-    if (std::fabs(a.t[k] - (&b.translation.x)[k]) > 0.5) return false;
-  const double dot = a.r.w * b.rotation.w + a.r.x * b.rotation.x + a.r.y * b.rotation.y + a.r.z * b.rotation.z;
-  return std::fabs(dot) > 1 - 1e-9;  // about 0.005 degrees; float32 Euler angles are far finer
+    if (std::fabs(a.t[k] - (&b.translation.x)[k]) > std::max(0.5, std::fabs(a.t[k]) * 1.2e-7) + (slackT ? slackT[k] : 0))
+      return false;
+  const double dot = std::min(1.0, std::fabs(a.r.w * b.rotation.w + a.r.x * b.rotation.x + a.r.y * b.rotation.y + a.r.z * b.rotation.z));
+  return 2 * std::acos(dot) < 1e-4 + slackA;  // 1e-4 rad = 0.006 degrees; float32 Euler angles are far finer
 }
+bool Close(const Pose& a, const ufbx_transform& b) { return Close(a, b, nullptr, 0); }
 Pose PoseOf(const double t[3], const double e[3]) { return {{t[0], t[1], t[2]}, Normalised(EulerToQuat(e))}; }
+Pose PoseOf(const ufbx_transform& f) {
+  return {{f.translation.x, f.translation.y, f.translation.z}, Normalised({f.rotation.w, f.rotation.x, f.rotation.y, f.rotation.z})};
+}
+bool SameRotation(Q a, Q b) {
+  a = Normalised(a), b = Normalised(b);
+  return std::fabs(a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z) > 1 - 1e-9;
+}
+
+// key fields by name, and a key built from them for a flag word (fields the word adds start at 0)
+std::map<std::string, int32_t> Fields(const scene::Key& k) {
+  std::map<std::string, int32_t> m;
+  const auto l = scene::KeyLayout(k.flags);
+  for (size_t i = 0; i < l.size() && i < k.values.size(); i++) m[l[i].name] = k.values[i];
+  return m;
+}
+scene::Key MakeKey(uint32_t flags, const std::map<std::string, int32_t>& m) {
+  scene::Key k;
+  k.flags = flags;
+  for (auto& f : scene::KeyLayout(flags)) {
+    auto it = m.find(f.name);
+    k.values.push_back(it == m.end() ? 0 : it->second);
+  }
+  return k;
+}
+// an engine rotation as the axis-angle fields (angle in turns, axis stored negated)
+void SetAxisAngle(std::map<std::string, int32_t>& m, Q g) {
+  g = Normalised(g);
+  if (g.w < 0) g = {-g.w, -g.x, -g.y, -g.z};
+  const double half = std::acos(std::clamp(g.w, -1.0, 1.0)), sn = std::sin(half);
+  double ax = 0, ay = 0, az = 0;
+  if (sn > 1e-9) ax = g.x / sn, ay = g.y / sn, az = g.z / sn;
+  m["angle"] = static_cast<int32_t>(std::llround(2 * half / (2 * kPi) * kFix));
+  m["ax"] = static_cast<int32_t>(std::llround(-ax * kFix));
+  m["ay"] = static_cast<int32_t>(std::llround(-ay * kFix));
+  m["az"] = static_cast<int32_t>(std::llround(-az * kFix));
+}
+
+// A part's keys after the FBX: every stored key the FBX shows unchanged stays as it is; a changed one gets the FBX
+// pose in its own form (its flags, TCB, colour, FOV, extra kept; a relative rotation stays relative); an FBX key
+// where no stored key is and the keys so far do not give the FBX pose becomes a new key, with the flags and
+// parameters of the key before it and an absolute rotation. Relative keys after a changed one are encoded again so
+// their own orientation does not move. "at" is the part's FBX pose at a time (seconds), "frame" the FBX frame length.
+struct MergeResult {
+  std::vector<scene::Key> keys;
+  int changed = 0, added = 0;
+};
+MergeResult MergeKeys(const std::vector<scene::Key>& stored, const std::function<ufbx_transform(double)>& at,
+                      const std::vector<double>& fbxTimes, const std::array<std::vector<double>, 6>& channels,
+                      double frame, bool needKey, bool fromBlender) {
+  scene::Part probe;
+  probe.keys = stored;
+  const auto poses = KeyPoses(probe);
+  const auto times = scene::KeyTimes(probe);
+  const auto eq = EngineQuats(probe);
+  const ExportedAnim exported = ExportAnim(poses, times);
+  bool ordered = true;
+  for (size_t i = 1; i < times.size(); i++) ordered &= times[i] >= times[i - 1];
+
+  double et[3], ee[3];
+  // the motion of the curves within 2 ms of t: Blender's baked frames are off our times (measured: about 0.4 ms; its
+  // curve simplification adds to it)
+  auto slack = [&](const ExportedAnim& a, double t, double* sT, double& sA) {
+    sT[0] = sT[1] = sT[2] = sA = 0;
+    if (!a.moves || !fromBlender) return;  // other writers keep the key times: no timing error to allow for
+    double t0[3], e0[3], t1[3], e1[3];
+    a.Eval(t - 0.002, t0, e0), a.Eval(t + 0.002, t1, e1);
+    for (int k = 0; k < 3; k++) sT[k] = std::fabs(t1[k] - t0[k]);
+    const Q q0 = Normalised(EulerToQuat(e0)), q1 = Normalised(EulerToQuat(e1));
+    sA = 2 * std::acos(std::min(1.0, std::fabs(q0.w * q1.w + q0.x * q1.x + q0.y * q1.y + q0.z * q1.z)));
+  };
+  // Blender bakes every frame and then, channel by channel, drops the frames a line through their neighbours gives
+  // within 0.1% of the values (bake_anim_simplify_factor 1, the default): where a channel's keys are sparser than a
+  // frame, its curve is only that close (measured on objects/cut/04705: up to 0.3% once drops add up)
+  auto sparse = [&](const std::vector<double>& ts, double t) {
+    if (ts.empty()) return false;
+    auto it = std::lower_bound(ts.begin(), ts.end(), t - 1e-6);
+    const bool on = it != ts.end() && *it <= t + 1e-6;
+    const double next = on ? (it + 1 != ts.end() ? *(it + 1) : 1e30) : (it != ts.end() ? *it : 1e30);
+    const double prev = it != ts.begin() ? *(it - 1) : -1e30;
+    return next - t > 1.5 * frame || t - prev > 1.5 * frame;
+  };
+  auto blenderSlack = [&](double t, const Pose& p, double* sT, double& sA) {
+    if (!fromBlender) return;
+    for (int k = 0; k < 3; k++)
+      if (sparse(channels[k], t)) sT[k] += 5e-3 * std::fabs(p.t[k]);
+    for (int k = 0; k < 3; k++)
+      if (sparse(channels[3 + k], t)) sA += 5e-3 * kPi / 3;
+  };
+  // the exported curves show f at time ts: their value, any key at ts (keys sharing a time), or - for a DCC that
+  // bakes to frames - the line between their values at the frames around ts
+  auto shows = [&](double ts, const ufbx_transform& f) {
+    double sT[3], sA;
+    slack(exported, ts, sT, sA);
+    blenderSlack(ts, PoseOf(f), sT, sA);
+    exported.Eval(ts, et, ee);
+    if (Close(PoseOf(et, ee), f, sT, sA)) return true;
+    for (size_t j = 0; j < exported.time.size(); j++)
+      if (exported.time[j] == ts && Close(PoseOf(exported.t[j].data(), exported.e[j].data()), f)) return true;
+    if (!exported.moves) return false;
+    const double f0 = std::floor(ts / frame) * frame, f1 = f0 + frame, w = (ts - f0) / frame;
+    double t0[3], e0[3], t1[3], e1[3];
+    exported.Eval(f0, t0, e0), exported.Eval(f1, t1, e1);
+    for (int k = 0; k < 3; k++) et[k] = t0[k] + (t1[k] - t0[k]) * w, ee[k] = e0[k] + (e1[k] - e0[k]) * w;
+    return Close(PoseOf(et, ee), f, sT, sA);
+  };
+  // a DCC that bakes whole frames ends at the last one: a key after it (within a frame) is checked there
+  const double fbxEnd = fbxTimes.empty() ? 0 : fbxTimes.back();
+  auto checkTime = [&](double ts) { return !fbxTimes.empty() && ts > fbxEnd && ts - fbxEnd < frame ? fbxEnd : ts; };
+
+  // The FBX pose exactly at a changed key's time ts. A DCC that bakes to frames has no sample there: the key is a
+  // corner of its (linear) curve, which the two frames before it (after the key before, at prevTs) or the two
+  // after it (before the key after, at nextTs) lie on - the line through them ends at the corner.
+  auto poseAtKey = [&](double ts, double prevTs, double nextTs) -> Pose {
+    auto it = std::lower_bound(fbxTimes.begin(), fbxTimes.end(), ts - 1e-4);
+    if (fbxTimes.empty() || (it != fbxTimes.end() && *it <= ts + 1e-4)) return PoseOf(at(ts));
+    double a = 0, b = 0;
+    if (it - fbxTimes.begin() >= 2 && *(it - 2) > prevTs + 1e-4) a = *(it - 2), b = *(it - 1);
+    else if (fbxTimes.end() - it >= 2 && *(it + 1) < nextTs - 1e-4) a = *(it + 1), b = *it;
+    else return PoseOf(at(ts));
+    const Pose pa = PoseOf(at(a)), pb = PoseOf(at(b));
+    const double s = (ts - a) / (b - a);
+    Pose out;
+    for (int k = 0; k < 3; k++) out.t[k] = pa.t[k] + (pb.t[k] - pa.t[k]) * s;
+    // rotation: pa (x) (pa^-1 (x) pb)^s
+    Q d = Mul(Q{pa.r.w, -pa.r.x, -pa.r.y, -pa.r.z}, pb.r);
+    if (d.w < 0) d = {-d.w, -d.x, -d.y, -d.z};
+    const double half = std::acos(std::clamp(d.w, -1.0, 1.0)), sn = std::sin(half);
+    Q p{1, 0, 0, 0};
+    if (sn > 1e-12) {
+      const double h = half * s, k = std::sin(h) / sn;
+      p = {std::cos(h), d.x * k, d.y * k, d.z * k};
+    }
+    out.r = Normalised(Mul(pa.r, p));
+    return out;
+  };
+
+  struct K {
+    int64_t ms;
+    Pose pose;  // FBX space
+    int src;    // stored key, -1 for a new one
+    bool changed;
+  };
+  std::vector<K> ks;
+  for (size_t i = 0; i < stored.size(); i++) {
+    // keys out of time order: only the rest pose is in the FBX
+    const bool check = ordered || i == 0;
+    const double ts = checkTime(times[i] / 1000.0);
+    const ufbx_transform f = at(check ? ts : 0.0);
+    const bool same = !check || shows(ts, f);
+    if (!same && getenv("X3_SCENE_DEBUG"))
+      fprintf(stderr, "  key %zu at %lld ms: stored t %.1f %.1f %.1f q %.5f %.5f %.5f %.5f, FBX t %.1f %.1f %.1f q %.5f %.5f %.5f %.5f\n", i,
+              static_cast<long long>(times[i]), poses[i].t[0], poses[i].t[1], poses[i].t[2], poses[i].r.w, poses[i].r.x,
+              poses[i].r.y, poses[i].r.z, f.translation.x, f.translation.y, f.translation.z, f.rotation.w, f.rotation.x,
+              f.rotation.y, f.rotation.z);
+    const double prevTs = i ? times[i - 1] / 1000.0 : -1e30, nextTs = i + 1 < times.size() ? times[i + 1] / 1000.0 : 1e30;
+    Pose pose = poses[i];
+    bool changed = !same;
+    if (changed) {
+      pose = check ? poseAtKey(ts, prevTs, nextTs) : PoseOf(f);
+      // a key next to an edited one: the frames around it straddle the edit, but its corner is where it was
+      ufbx_transform corner{};
+      corner.translation = {pose.t[0], pose.t[1], pose.t[2]};
+      corner.rotation = {pose.r.x, pose.r.y, pose.r.z, pose.r.w};
+      double sT[3], sA;
+      slack(exported, ts, sT, sA);
+      blenderSlack(ts, pose, sT, sA);
+      if (Close(poses[i], corner, sT, sA)) pose = poses[i], changed = false;
+    }
+    ks.push_back({times[i], pose, static_cast<int>(i), changed});
+  }
+  int added = 0;
+  if (ordered) {
+    std::vector<double> candidates = fbxTimes;
+    candidates.insert(candidates.begin(), 0.0);
+    const int64_t tol = std::max<int64_t>(1, std::llround(frame * 500));  // half a frame, in ms
+    for (double t : candidates) {
+      if (t < 0) continue;
+      const int64_t ms = std::llround(t * 1000);
+      bool near = false;
+      for (auto& k : ks) near |= std::llabs(k.ms - ms) <= tol;
+      if (near) continue;
+      std::vector<Pose> ps;
+      std::vector<int64_t> ts;
+      for (auto& k : ks) ps.push_back(k.pose), ts.push_back(k.ms);
+      const ufbx_transform f = at(t);
+      // (no keys at all: the engine's pose is the origin; a new part gets its key at 0 anyway)
+      if (!ks.empty() || !(needKey && t == 0.0)) {
+        const ExportedAnim sofar = ExportAnim(ps, ts);
+        double sT[3], sA;
+        slack(sofar, t, sT, sA);
+        blenderSlack(t, PoseOf(f), sT, sA);
+        sofar.Eval(t, et, ee);
+        if (Close(PoseOf(et, ee), f, sT, sA)) continue;
+      }
+      if (getenv("X3_SCENE_DEBUG") && added < 3)
+        fprintf(stderr, "  new key at %.4f s: FBX t %.1f %.1f %.1f, keys so far give %.1f %.1f %.1f\n", t, f.translation.x,
+                f.translation.y, f.translation.z, et[0], et[1], et[2]);
+      auto pos = std::find_if(ks.begin(), ks.end(), [&](const K& k) { return k.ms > ms; });
+      ks.insert(pos, K{ms, PoseOf(f), -1, true});
+      added++;
+    }
+  }
+
+  MergeResult out;
+  out.added = added;
+  Q run;
+  double carried[3] = {0, 0, 0};  // game position so far
+  for (size_t j = 0; j < ks.size(); j++) {
+    const K& k = ks[j];
+    scene::Key key;
+    if (k.src >= 0 && !k.changed) {
+      key = stored[k.src];
+      // the rotation it gives after earlier changes; if it moved, encode it again for its stored orientation
+      if (!(key.flags & 8) && !SameRotation(StepRotation(run, key), eq[k.src])) {
+        auto m = Fields(key);
+        uint32_t fl = (key.flags & ~0x20u) | 2;
+        SetAxisAngle(m, fl & 0x2000 ? eq[k.src] : Mul(Q{run.w, -run.x, -run.y, -run.z}, Normalised(eq[k.src])));
+        key = MakeKey(fl, m);
+      }
+      // a key without its own position carries the one before; if that one changed, it gets its stored position
+      if (key.flags & 0x10) {
+        const double want[3] = {k.pose.t[0], k.pose.t[1], -k.pose.t[2]};
+        bool moved = false;
+        for (int c = 0; c < 3; c++) moved |= std::fabs(want[c] - carried[c]) > 0.5;
+        if (moved) {
+          auto m = Fields(key);
+          m["x"] = static_cast<int32_t>(std::llround(want[0]));
+          m["y"] = static_cast<int32_t>(std::llround(want[1]));
+          m["z"] = static_cast<int32_t>(std::llround(want[2]));
+          key = MakeKey(key.flags & ~0x10u, m);
+        }
+      }
+    } else {
+      // a changed key keeps its own form; a new one takes the one before it (or a plain absolute key)
+      const scene::Key* base = k.src >= 0 ? &stored[k.src] : nullptr;
+      scene::Key prevOut;
+      if (!base && !out.keys.empty()) prevOut = out.keys.back(), base = &prevOut;
+      uint32_t fl = base ? base->flags : 0x2002;
+      auto m = base ? Fields(*base) : std::map<std::string, int32_t>{};
+      if (k.src < 0) fl = (fl & ~0x10u) | 0x2000;  // a new key: own position, absolute rotation
+      const double want[3] = {k.pose.t[0], k.pose.t[1], -k.pose.t[2]};
+      bool moved = false;
+      for (int c = 0; c < 3; c++) moved |= std::fabs(want[c] - carried[c]) > 0.5;
+      if ((fl & 0x10) && moved) fl &= ~0x10u;
+      if (!(fl & 0x10)) {
+        m["x"] = static_cast<int32_t>(std::llround(want[0]));
+        m["y"] = static_cast<int32_t>(std::llround(want[1]));
+        m["z"] = static_cast<int32_t>(std::llround(want[2]));
+      }
+      if (!(fl & 8)) {
+        const Q g = Normalised(FbxToGame(k.pose.r));
+        if (k.src < 0 || !SameRotation(StepRotation(run, MakeKey(fl, m)), g)) {
+          fl = (fl & ~0x20u) | 2;
+          SetAxisAngle(m, fl & 0x2000 ? g : Mul(Q{run.w, -run.x, -run.y, -run.z}, g));
+        }
+      }
+      key = MakeKey(fl, m);
+      if (k.src >= 0) out.changed++;
+    }
+    run = StepRotation(run, key);
+    if (key.Has("x")) carried[0] = key.Get("x"), carried[1] = key.Get("y"), carried[2] = key.Get("z");
+    out.keys.push_back(std::move(key));
+  }
+  // times: with new keys, every dt from the absolute times; extra (unused by the engine) of the new keys and of a
+  // former last key follows the common "next key" pattern
+  if (added) {
+    const auto layoutIndex = [](const scene::Key& k, const char* name) {
+      const auto l = scene::KeyLayout(k.flags);
+      for (size_t i = 0; i < l.size(); i++)
+        if (strcmp(l[i].name, name) == 0) return i;
+      return l.size();
+    };
+    for (size_t j = 0; j < out.keys.size(); j++) {
+      scene::Key& key = out.keys[j];
+      const bool last = j + 1 == out.keys.size();
+      key.values[layoutIndex(key, "dt")] = last ? -1 : static_cast<int32_t>(ks[j + 1].ms - ks[j].ms);
+      int32_t& extra = key.values[layoutIndex(key, "extra")];
+      if (ks[j].src < 0 || (extra == -1 && !last)) extra = last ? -1 : static_cast<int32_t>(j + 1);
+    }
+  }
+  return out;
+}
+
+// The animation stack that holds a node's own animation. One stack (ours, Max, Maya, Blender with "All Actions"
+// off) is the scene's; Blender's default writes every action applied to every object as stacks "object|action" -
+// the node's own is the one whose action is named after it (an imported "N|..." or a new "NAction"), else the only
+// stack that animates it, else the first stack.
+using StackCache = std::map<const ufbx_node*, const ufbx_anim_stack*>;
+const ufbx_anim_stack* StackFor(const ufbx_scene* s, const ufbx_node* n, StackCache& cache) {
+  auto it = cache.find(n);
+  if (it != cache.end()) return it->second;
+  const std::string name(n->name.data, n->name.length);
+  std::vector<const ufbx_anim_stack*> having;
+  for (size_t i = 0; i < s->anim_stacks.count; i++) {
+    const ufbx_anim_stack* st = s->anim_stacks.data[i];
+    bool has = false;
+    for (size_t l = 0; l < st->layers.count && !has; l++)
+      for (size_t k = 0; k < st->layers.data[l]->anim_props.count && !has; k++)
+        has = st->layers.data[l]->anim_props.data[k].element == &n->element;
+    if (has) having.push_back(st);
+  }
+  const ufbx_anim_stack* pick = s->anim_stacks.count ? s->anim_stacks.data[0] : nullptr;
+  if (having.size() == 1) pick = having[0];
+  for (int pass = 0; pass < 2 && having.size() > 1; pass++)
+    for (const ufbx_anim_stack* st : having) {
+      const std::string sn(st->name.data, st->name.length);
+      if (sn.compare(0, name.size() + 1, name + "|") != 0) continue;
+      const std::string action = sn.substr(name.size() + 1);
+      if (pass == 0 ? action.compare(0, name.size() + 1, name + "|") == 0 : action == name + "Action") {
+        pick = st, pass = 2;
+        break;
+      }
+    }
+  return cache[n] = pick;
+}
 
 // times (seconds) of the translation / rotation keys of a node and its ancestors up to (not including) stop
-std::vector<double> AnimTimes(const ufbx_scene* s, const ufbx_node* n, const ufbx_node* stop) {
+std::vector<double> AnimTimes(const ufbx_scene* s, const ufbx_node* n, const ufbx_node* stop, StackCache& cache) {
   std::set<double> t;
-  for (const ufbx_node* a = n; a && a != stop; a = a->parent)
-    for (size_t li = 0; li < s->anim_layers.count; li++) {
-      const ufbx_anim_layer* layer = s->anim_layers.data[li];
+  for (const ufbx_node* a = n; a && a != stop; a = a->parent) {
+    const ufbx_anim_stack* st = StackFor(s, a, cache);
+    if (!st) continue;
+    for (size_t li = 0; li < st->layers.count; li++) {
+      const ufbx_anim_layer* layer = st->layers.data[li];
       for (size_t pi = 0; pi < layer->anim_props.count; pi++) {
         const ufbx_anim_prop& ap = layer->anim_props.data[pi];
         if (ap.element != &a->element) continue;
@@ -385,16 +705,39 @@ std::vector<double> AnimTimes(const ufbx_scene* s, const ufbx_node* n, const ufb
             for (size_t k = 0; k < cv->keyframes.count; k++) t.insert(cv->keyframes.data[k].time);
       }
     }
+  }
   return std::vector<double>(t.begin(), t.end());
+}
+
+// key times (seconds) per channel of the node's own curves: Lcl Translation x, y, z, then Lcl Rotation x, y, z
+std::array<std::vector<double>, 6> ChannelTimes(const ufbx_scene* s, const ufbx_node* n, StackCache& cache) {
+  std::array<std::vector<double>, 6> out;
+  const ufbx_anim_stack* st = StackFor(s, n, cache);
+  if (!st) return out;
+  for (size_t li = 0; li < st->layers.count; li++)
+    for (size_t pi = 0; pi < st->layers.data[li]->anim_props.count; pi++) {
+      const ufbx_anim_prop& ap = st->layers.data[li]->anim_props.data[pi];
+      if (ap.element != &n->element) continue;
+      const std::string prop(ap.prop_name.data, ap.prop_name.length);
+      const int base = prop == "Lcl Translation" ? 0 : prop == "Lcl Rotation" ? 3 : -1;
+      if (base < 0) continue;
+      for (int c = 0; c < 3; c++)
+        if (const ufbx_anim_curve* cv = ap.anim_value->curves[c])
+          for (size_t k = 0; k < cv->keyframes.count; k++) out[base + c].push_back(cv->keyframes.data[k].time);
+    }
+  for (auto& v : out) std::sort(v.begin(), v.end());
+  return out;
 }
 
 // The part's transform at time t (seconds) relative to stop (its nearest part ancestor, or null for the scene's
 // top): the product of the local transforms of the node and of every node between, so grouping nodes, a scaled
 // scene root (Blender's unit scale) and the unit conversion of ufbx all count. Translation in game units.
-ufbx_transform Relative(const ufbx_scene* s, const ufbx_node* n, const ufbx_node* stop, double t, double unitMm) {
+ufbx_transform Relative(const ufbx_scene* s, const ufbx_node* n, const ufbx_node* stop, double t, double unitMm,
+                        StackCache& cache) {
   ufbx_matrix m = ufbx_identity_matrix;
   for (const ufbx_node* a = n; a && a != stop; a = a->parent) {
-    const ufbx_transform lt = s->anim ? ufbx_evaluate_transform(s->anim, a, t) : a->local_transform;
+    const ufbx_anim_stack* st = StackFor(s, a, cache);
+    const ufbx_transform lt = st ? ufbx_evaluate_transform(st->anim, a, t) : a->local_transform;
     const ufbx_matrix l = ufbx_transform_to_matrix(&lt);
     m = ufbx_matrix_mul(&l, &m);
   }
@@ -404,6 +747,16 @@ ufbx_transform Relative(const ufbx_scene* s, const ufbx_node* n, const ufbx_node
 }
 
 }  // namespace
+
+std::vector<std::array<double, 7>> KeyPosesFbx(const scene::Part& part) {
+  std::vector<std::array<double, 7>> out;
+  for (auto& ps : KeyPoses(part)) out.push_back({ps.t[0], ps.t[1], ps.t[2], ps.r.w, ps.r.x, ps.r.y, ps.r.z});
+  return out;
+}
+std::array<double, 4> EulerQuat(const double euler[3]) {
+  const Q q = Normalised(EulerToQuat(euler));
+  return {q.w, q.x, q.y, q.z};
+}
 
 bool FbxIsScene(const std::string& path) {
   ufbx_scene* s = Load(path);
@@ -434,6 +787,18 @@ scene::Scene FbxToScene(const std::string& path, SceneImportReport& rep) {
   if (const ufbx_prop* up = ufbx_find_prop(&root->props, "x3_unit_mm"))
     if (up->value_real > 0) unitMm = up->value_real;
   const double frame = s->settings.frames_per_second > 0 ? 1.0 / s->settings.frames_per_second : 1.0 / 30;
+  StackCache stacks;
+  const bool fromBlender = s->metadata.exporter == UFBX_EXPORTER_BLENDER_BINARY || s->metadata.exporter == UFBX_EXPORTER_BLENDER_ASCII;
+  if (getenv("X3_SCENE_DEBUG")) rep.notes.push_back(std::string("written by Blender: ") + (fromBlender ? "yes" : "no"));
+  if (getenv("X3_SCENE_DEBUG"))
+    for (size_t i = 0; i < s->anim_stacks.count; i++) {
+      const ufbx_anim_stack* st = s->anim_stacks.data[i];
+      std::set<const ufbx_element*> els;
+      for (size_t l = 0; l < st->layers.count; l++)
+        for (size_t k = 0; k < st->layers.data[l]->anim_props.count; k++) els.insert(st->layers.data[l]->anim_props.data[k].element);
+      rep.notes.push_back("stack '" + std::string(st->name.data, st->name.length) + "': " + std::to_string(st->layers.count) +
+                          " layers, " + std::to_string(els.size()) + " elements");
+    }
 
   // part nodes: x3_part (stored) or x3_body without x3_part (new), in stored order, new ones after; a copy made in
   // the DCC carries the x3_order of its original - the first node keeps it, the copies become new parts (part
@@ -518,96 +883,28 @@ scene::Scene FbxToScene(const std::string& path, SceneImportReport& rep) {
     if (PHas(pp, "x3_embedded")) p.embedded = Unbase64(PStr(pp, "x3_embedded"));
     if (PHas(pp, "x3_inline")) p.inlineText = PStr(pp, "x3_inline");
 
-    const auto fbxTimes = AnimTimes(s, n, anchor);
-    auto at = [&](double t) { return Relative(s, n, anchor, t, unitMm); };
-    // keys: stored ones while the FBX still shows what the export wrote, else rebuilt from the FBX
-    bool kept = false;
+    const auto fbxTimes = AnimTimes(s, n, anchor, stacks);
+    auto at = [&](double t) { return Relative(s, n, anchor, t, unitMm, stacks); };
+    // keys: the stored ones merged key by key with what the FBX shows (a new part: keys from the FBX)
+    std::vector<scene::Key> stored;
     if (it.stored && PHas(pp, "x3_keys")) {
-      std::vector<scene::Key> stored;
-      bool decoded = true;
       try {
         stored = KeysFromBlob(PStr(pp, "x3_keys"));
       } catch (const std::exception&) {
-        decoded = false;
-        rep.notes.push_back("part P" + std::to_string(p.index) + ": x3_keys does not decode");
-      }
-      scene::Part probe;
-      probe.keys = stored;
-      const auto poses = KeyPoses(probe);
-      const auto times = scene::KeyTimes(probe);
-      const ExportedAnim exported = ExportAnim(poses, times);
-      std::string where;
-      bool same = decoded;
-      double et[3], ee[3];
-      // the exported curves at time ts, or (keys sharing a time: the curve holds one of them) any key at ts
-      auto shows = [&](double ts, const ufbx_transform& f) {
-        exported.Eval(ts, et, ee);
-        if (Close(PoseOf(et, ee), f)) return true;
-        for (size_t j = 0; j < exported.time.size(); j++)
-          if (exported.time[j] == ts && Close(PoseOf(exported.t[j].data(), exported.e[j].data()), f)) return true;
-        return false;
-      };
-      // the rest pose (for a static export of keys out of time order the only thing the FBX shows)
-      if (same && !shows(0, at(0))) same = false, where = "rest pose";
-      // every FBX key shows the exported curves (a DCC that bakes keys to frames samples them there)
-      for (size_t i = 0; same && i < fbxTimes.size(); i++)
-        if (!shows(fbxTimes[i], at(fbxTimes[i]))) same = false, where = "FBX key at " + std::to_string(fbxTimes[i]) + " s";
-      // every stored key is still there: the FBX at its time is the exported value, or (baked to frames) the line
-      // between the exported values at the frames around it
-      if (exported.moves)
-        for (size_t i = 0; same && i < exported.time.size(); i++) {
-          const double ts = exported.time[i];
-          const ufbx_transform f = at(ts);
-          bool ok = shows(ts, f);
-          if (!ok) {
-            const double f0 = std::floor(ts / frame) * frame, f1 = f0 + frame, w = (ts - f0) / frame;
-            double t0[3], e0[3], t1[3], e1[3];
-            exported.Eval(f0, t0, e0), exported.Eval(f1, t1, e1);
-            for (int k = 0; k < 3; k++) et[k] = t0[k] + (t1[k] - t0[k]) * w, ee[k] = e0[k] + (e1[k] - e0[k]) * w;
-            ok = Close(PoseOf(et, ee), f);
-          }
-          if (!ok) same = false, where = "key " + std::to_string(i) + " at " + std::to_string(times[i]) + " ms";
-        }
-      if (getenv("X3_SCENE_DEBUG") && fbxTimes.size()) {
-        const ufbx_transform f = at(fbxTimes.back());
-        char b[200];
-        snprintf(b, sizeof b, "P%u: %zu FBX key times (last %.3f s: t %.1f %.1f %.1f), %zu stored keys", p.index,
-                 fbxTimes.size(), fbxTimes.back(), f.translation.x, f.translation.y, f.translation.z, stored.size());
-        rep.notes.push_back(b);
-      }
-      if (same) {
-        p.keys = stored, kept = true;
-      } else if (getenv("X3_SCENE_DEBUG")) {
-        rep.notes.push_back("P" + std::to_string(p.index) + ": changed at " + where);
+        rep.notes.push_back("part P" + std::to_string(p.index) + ": x3_keys does not decode, keys taken from the FBX");
       }
     }
-    if (!kept) {
-      std::vector<double> times = fbxTimes;
-      // the engine's time starts at 0: an animation that starts later keeps its offset with a key at 0
-      if (times.empty() || times.front() > 0) times.insert(times.begin(), 0.0);
-      for (size_t i = 0; i < times.size(); i++) {
-        const ufbx_transform tr = at(times[i]);
-        const Q g = Normalised(FbxToGame({tr.rotation.w, tr.rotation.x, tr.rotation.y, tr.rotation.z}));
-        scene::Key k;
-        k.flags = 0x2002;  // position + absolute axis-angle rotation
-        const Q q = g.w < 0 ? Q{-g.w, -g.x, -g.y, -g.z} : g;
-        const double half = std::acos(std::clamp(q.w, -1.0, 1.0)), sn = std::sin(half);
-        const double angleTurns = 2 * half / (2 * kPi);
-        double ax = 0, ay = 0, az = 0;
-        if (sn > 1e-9) ax = q.x / sn, ay = q.y / sn, az = q.z / sn;
-        // dt from rounded absolute times, so the rounding does not add up over the keys
-        const int32_t dt = i + 1 < times.size()
-                               ? static_cast<int32_t>(std::llround(times[i + 1] * 1000) - std::llround(times[i] * 1000))
-                               : -1;
-        k.values = {static_cast<int32_t>(std::llround(tr.translation.x)), static_cast<int32_t>(std::llround(tr.translation.y)),
-                    static_cast<int32_t>(std::llround(-tr.translation.z)),
-                    static_cast<int32_t>(std::llround(angleTurns * kFix)),
-                    static_cast<int32_t>(std::llround(-ax * kFix)), static_cast<int32_t>(std::llround(-ay * kFix)),
-                    static_cast<int32_t>(std::llround(-az * kFix)), dt, i + 1 < times.size() ? static_cast<int32_t>(i + 1) : -1};
-        p.keys.push_back(k);
-      }
-      if (it.stored) rep.notes.push_back("part P" + std::to_string(p.index) + ": keys rebuilt from the FBX");
+    const MergeResult merged = MergeKeys(stored, at, fbxTimes, ChannelTimes(s, n, stacks), frame, !it.stored, fromBlender);
+    p.keys = merged.keys;
+    bool kept = merged.changed == 0 && merged.added == 0 && !stored.empty();
+    if (!kept && !stored.empty() && p.keys.size() == stored.size()) {  // re-encoded relative keys only
+      kept = true;
+      for (size_t i = 0; kept && i < stored.size(); i++)
+        kept = p.keys[i].flags == stored[i].flags && p.keys[i].values == stored[i].values;
     }
+    if (it.stored && !kept)
+      rep.notes.push_back("part P" + std::to_string(p.index) + ": " + std::to_string(merged.changed) + " of " +
+                          std::to_string(stored.size()) + " keys changed, " + std::to_string(merged.added) + " added");
     rep.parts++;
     if (kept) rep.keptKeys++;
     else rep.rebuiltKeys++;

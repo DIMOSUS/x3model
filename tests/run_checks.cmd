@@ -11,3 +11,5 @@ echo == roundtrip-fbx (expected: identical 2489, error 11: the truncated body an
 "%X%" roundtrip-fbx "%GAME%"
 echo == roundtrip-scenes (expected: identical 949, error 2: the two text scenes the engine refuses)
 "%X%" roundtrip-scenes "%GAME%"
+echo == roundtrip-scenes --perturb (expected: edited parts 2882, as expected 2882)
+"%X%" roundtrip-scenes "%GAME%" --perturb
