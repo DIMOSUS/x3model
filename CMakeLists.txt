@@ -17,6 +17,7 @@ add_executable(x3model
   src/textbody.cpp
   src/scene.cpp
   src/scene_fbx.cpp
+  src/scene_anim.cpp
   src/ufbx_impl.cpp
 )
 target_include_directories(x3model PRIVATE src third_party/ufbx)

@@ -12,6 +12,7 @@
 #include "archive.hpp"
 #include "bob.hpp"
 #include "bytes.hpp"
+#include "scene_anim.hpp"
 #include "textbody.hpp"
 #include "ufbx.h"
 #include "util.hpp"
@@ -111,15 +112,52 @@ struct Pose {
   double t[3];
   Q r;
 };
-// per key: position (game units, FBX axes) and rotation (FBX), carrying values of keys that omit them
+// the rotation of an engine matrix (rows, 16.16; the standard matrix of the quaternion, as QuatToMatrixRows makes it)
+Q MatrixQuat(const std::array<std::array<int32_t, 3>, 3>& mi) {
+  double m[3][3];
+  for (int r = 0; r < 3; r++)
+    for (int c = 0; c < 3; c++) m[r][c] = mi[r][c] / kFix;
+  const double tr = m[0][0] + m[1][1] + m[2][2];
+  Q q;
+  if (tr > 0) {
+    const double s = std::sqrt(tr + 1) * 2;
+    q = {s / 4, (m[2][1] - m[1][2]) / s, (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s};
+  } else if (m[0][0] > m[1][1] && m[0][0] > m[2][2]) {
+    const double s = std::sqrt(1 + m[0][0] - m[1][1] - m[2][2]) * 2;
+    q = {(m[2][1] - m[1][2]) / s, s / 4, (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s};
+  } else if (m[1][1] > m[2][2]) {
+    const double s = std::sqrt(1 + m[1][1] - m[0][0] - m[2][2]) * 2;
+    q = {(m[0][2] - m[2][0]) / s, (m[0][1] + m[1][0]) / s, s / 4, (m[1][2] + m[2][1]) / s};
+  } else {
+    const double s = std::sqrt(1 + m[2][2] - m[0][0] - m[1][1]) * 2;
+    q = {(m[1][0] - m[0][1]) / s, (m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, s / 4};
+  }
+  return Normalised(q);
+}
+
+bool OwnRotation(uint32_t f) { return !(f & 8) && ((f & 2) || !(f & 0x20)) && !(f & 0x200 && !(f & 2)); }
+
+// Per key: the engine's position (game units, FBX axes) and rotation (FBX) at the key's time. A key with its own
+// position / axis-angle has its value (rotations composed in doubles); a key without one does not hold the previous
+// value: the engine interpolates the track there (linear or TCB between the keys that have one), as it does for the
+// orientation of a part with target or roll keys (cameras) at every time - those come from the engine evaluator.
 std::vector<Pose> KeyPoses(const scene::Part& p) {
   const auto qs = EngineQuats(p);
   std::vector<Pose> out;
+  const anim::Tracks tr = anim::Build(p);
+  const bool aimed = !tr.target.empty() || !tr.roll.empty();
+  const auto times = scene::KeyTimes(p);
+  bool ordered = true;  // (keys out of time order: the previous value, as the export cannot show more)
+  for (size_t i = 1; i < times.size(); i++) ordered &= times[i] >= times[i - 1];
   double pos[3] = {0, 0, 0};
   for (size_t i = 0; i < p.keys.size(); i++) {
     const auto& k = p.keys[i];
+    const anim::State st = ordered ? anim::Evaluate(tr, times[i]) : anim::State{};
     if (k.Has("x")) pos[0] = k.Get("x"), pos[1] = k.Get("y"), pos[2] = k.Get("z");
-    out.push_back({{pos[0], pos[1], -pos[2]}, GameToFbx(Normalised(qs[i]))});  // (file axes are not exactly unit)
+    else if (st.pos) pos[0] = (*st.pos)[0], pos[1] = (*st.pos)[1], pos[2] = (*st.pos)[2];
+    Q q = Normalised(qs[i]);  // (file axes are not exactly unit)
+    if ((aimed || !OwnRotation(k.flags)) && st.m) q = MatrixQuat(*st.m);
+    out.push_back({{pos[0], pos[1], -pos[2]}, GameToFbx(q)});
   }
   return out;
 }
@@ -280,7 +318,31 @@ fbx::Scene SceneToFbx(const scene::Scene& sc, const std::string& name, const Exp
     }
     const int nodeIndex = static_cast<int>(out.nodes.size());
     nodeOfPart[p.index] = nodeIndex;
+    const int parentNode = n.parent;
     out.nodes.push_back(n);
+
+    // a camera's target (keys with flag 8): a node beside the camera (the target is in the camera's parent space),
+    // with a key at every target key; moving it moves the target keys
+    const anim::Tracks tracks = anim::Build(p);
+    if (!tracks.target.empty()) {
+      fbx::Node tn;
+      tn.name = nm + "_target";
+      tn.parent = parentNode;
+      tn.props.push_back(fbx::Prop::Int("x3_target_of", static_cast<int64_t>(pi)));
+      const auto& t0 = tracks.target[0];
+      tn.translation[0] = t0.v[0], tn.translation[1] = t0.v[1], tn.translation[2] = -double(t0.v[2]);
+      bool moves = false;
+      for (auto& k : tracks.target) moves |= k.v[0] != t0.v[0] || k.v[1] != t0.v[1] || k.v[2] != t0.v[2];
+      for (size_t i = 1; i < tracks.target.size(); i++) moves &= tracks.target[i].t >= tracks.target[i - 1].t;
+      if (moves)
+        for (auto& k : tracks.target)
+          for (int c = 0; c < 3; c++) {
+            tn.animT[c].time.push_back(k.t / 1000.0);
+            tn.animT[c].value.push_back(c == 2 ? -double(k.v[2]) : k.v[c]);
+            animEnd = std::max(animEnd, k.t / 1000.0);
+          }
+      out.nodes.push_back(tn);
+    }
 
     // the body's LOD 0 geometry under the part (x3_ref: not part of the scene data)
     std::string key;
@@ -362,10 +424,11 @@ ufbx_scene* Load(const std::string& path) {
 // slackT / slackA: extra tolerance in game units (per axis) / radians (motion within the timing error of a DCC that
 // bakes, the error of its curve simplification)
 bool Close(const Pose& a, const ufbx_transform& b, const double* slackT, double slackA) {
-  // FBX curve values are float32: far from the origin (some planet scenes reach 1e8) a step is several units
+  // FBX curve values are float32, and Blender keeps them in float32 metres under a 0.001 scale: far from the origin
+  // (some scenes reach 3e8) that is several units (measured up to 2.2e-7 of the largest coordinate)
+  const double big = std::max({std::fabs(a.t[0]), std::fabs(a.t[1]), std::fabs(a.t[2])});
   for (int k = 0; k < 3; k++)
-    if (std::fabs(a.t[k] - (&b.translation.x)[k]) > std::max(0.5, std::fabs(a.t[k]) * 1.2e-7) + (slackT ? slackT[k] : 0))
-      return false;
+    if (std::fabs(a.t[k] - (&b.translation.x)[k]) > std::max(0.501, big * 4e-7) + (slackT ? slackT[k] : 0)) return false;
   const double dot = std::min(1.0, std::fabs(a.r.w * b.rotation.w + a.r.x * b.rotation.x + a.r.y * b.rotation.y + a.r.z * b.rotation.z));
   return 2 * std::acos(dot) < 1e-4 + slackA;  // 1e-4 rad = 0.006 degrees; float32 Euler angles are far finer
 }
@@ -432,14 +495,18 @@ MergeResult MergeKeys(const std::vector<scene::Key>& stored, const std::function
   double et[3], ee[3];
   // the motion of the curves within 2 ms of t: Blender's baked frames are off our times (measured: about 0.4 ms; its
   // curve simplification adds to it)
+  // a camera (target or roll keys): its orientation comes from them, the FBX rotation is not compared
+  const anim::Tracks engine = anim::Build(probe);
+  const bool aimed = !engine.target.empty() || !engine.roll.empty();
   auto slack = [&](const ExportedAnim& a, double t, double* sT, double& sA) {
-    sT[0] = sT[1] = sT[2] = sA = 0;
+    sT[0] = sT[1] = sT[2] = 0;
+    sA = aimed ? 10.0 : 0.0;
     if (!a.moves || !fromBlender) return;  // other writers keep the key times: no timing error to allow for
     double t0[3], e0[3], t1[3], e1[3];
     a.Eval(t - 0.002, t0, e0), a.Eval(t + 0.002, t1, e1);
     for (int k = 0; k < 3; k++) sT[k] = std::fabs(t1[k] - t0[k]);
     const Q q0 = Normalised(EulerToQuat(e0)), q1 = Normalised(EulerToQuat(e1));
-    sA = 2 * std::acos(std::min(1.0, std::fabs(q0.w * q1.w + q0.x * q1.x + q0.y * q1.y + q0.z * q1.z)));
+    sA = aimed ? 10.0 : 2 * std::acos(std::min(1.0, std::fabs(q0.w * q1.w + q0.x * q1.x + q0.y * q1.y + q0.z * q1.z)));
   };
   // Blender bakes every frame and then, channel by channel, drops the frames a line through their neighbours gives
   // within 0.1% of the values (bake_anim_simplify_factor 1, the default): where a channel's keys are sparser than a
@@ -469,7 +536,7 @@ MergeResult MergeKeys(const std::vector<scene::Key>& stored, const std::function
     if (Close(PoseOf(et, ee), f, sT, sA)) return true;
     for (size_t j = 0; j < exported.time.size(); j++)
       if (exported.time[j] == ts && Close(PoseOf(exported.t[j].data(), exported.e[j].data()), f)) return true;
-    if (!exported.moves) return false;
+    if (!exported.moves || !fromBlender) return false;
     const double f0 = std::floor(ts / frame) * frame, f1 = f0 + frame, w = (ts - f0) / frame;
     double t0[3], e0[3], t1[3], e1[3];
     exported.Eval(f0, t0, e0), exported.Eval(f1, t1, e1);
@@ -577,31 +644,18 @@ MergeResult MergeKeys(const std::vector<scene::Key>& stored, const std::function
   MergeResult out;
   out.added = added;
   Q run;
-  double carried[3] = {0, 0, 0};  // game position so far
   for (size_t j = 0; j < ks.size(); j++) {
     const K& k = ks[j];
     scene::Key key;
     if (k.src >= 0 && !k.changed) {
       key = stored[k.src];
-      // the rotation it gives after earlier changes; if it moved, encode it again for its stored orientation
-      if (!(key.flags & 8) && !SameRotation(StepRotation(run, key), eq[k.src])) {
+      // its own rotation after earlier changes; if that moved, encode it again for its stored orientation (a key
+      // without one, like one without a position, is interpolated by the engine and holds nothing)
+      if (!aimed && OwnRotation(key.flags) && !SameRotation(StepRotation(run, key), eq[k.src])) {
         auto m = Fields(key);
         uint32_t fl = (key.flags & ~0x20u) | 2;
         SetAxisAngle(m, fl & 0x2000 ? eq[k.src] : Mul(Q{run.w, -run.x, -run.y, -run.z}, Normalised(eq[k.src])));
         key = MakeKey(fl, m);
-      }
-      // a key without its own position carries the one before; if that one changed, it gets its stored position
-      if (key.flags & 0x10) {
-        const double want[3] = {k.pose.t[0], k.pose.t[1], -k.pose.t[2]};
-        bool moved = false;
-        for (int c = 0; c < 3; c++) moved |= std::fabs(want[c] - carried[c]) > 0.5;
-        if (moved) {
-          auto m = Fields(key);
-          m["x"] = static_cast<int32_t>(std::llround(want[0]));
-          m["y"] = static_cast<int32_t>(std::llround(want[1]));
-          m["z"] = static_cast<int32_t>(std::llround(want[2]));
-          key = MakeKey(key.flags & ~0x10u, m);
-        }
       }
     } else {
       // a changed key keeps its own form; a new one takes the one before it (or a plain absolute key)
@@ -611,18 +665,23 @@ MergeResult MergeKeys(const std::vector<scene::Key>& stored, const std::function
       uint32_t fl = base ? base->flags : 0x2002;
       auto m = base ? Fields(*base) : std::map<std::string, int32_t>{};
       if (k.src < 0) fl = (fl & ~0x10u) | 0x2000;  // a new key: own position, absolute rotation
+      // a key without its own position gets one only if the FBX shows another than the engine gives there
       const double want[3] = {k.pose.t[0], k.pose.t[1], -k.pose.t[2]};
-      bool moved = false;
-      for (int c = 0; c < 3; c++) moved |= std::fabs(want[c] - carried[c]) > 0.5;
-      if ((fl & 0x10) && moved) fl &= ~0x10u;
+      if ((fl & 0x10) && k.src >= 0) {
+        bool moved = false;
+        for (int c = 0; c < 3; c++) moved |= std::fabs(k.pose.t[c] - poses[k.src].t[c]) > 0.5;
+        if (moved) fl &= ~0x10u;
+      }
       if (!(fl & 0x10)) {
         m["x"] = static_cast<int32_t>(std::llround(want[0]));
         m["y"] = static_cast<int32_t>(std::llround(want[1]));
         m["z"] = static_cast<int32_t>(std::llround(want[2]));
       }
-      if (!(fl & 8)) {
+      if (!(fl & 8) && !aimed) {
         const Q g = Normalised(FbxToGame(k.pose.r));
-        if (k.src < 0 || !SameRotation(StepRotation(run, MakeKey(fl, m)), g)) {
+        const bool keep = k.src >= 0 && (OwnRotation(fl) ? SameRotation(StepRotation(run, MakeKey(fl, m)), g)
+                                                          : SameRotation(FbxToGame(poses[k.src].r), g));
+        if (!keep) {
           fl = (fl & ~0x20u) | 2;
           SetAxisAngle(m, fl & 0x2000 ? g : Mul(Q{run.w, -run.x, -run.y, -run.z}, g));
         }
@@ -631,7 +690,6 @@ MergeResult MergeKeys(const std::vector<scene::Key>& stored, const std::function
       if (k.src >= 0) out.changed++;
     }
     run = StepRotation(run, key);
-    if (key.Has("x")) carried[0] = key.Get("x"), carried[1] = key.Get("y"), carried[2] = key.Get("z");
     out.keys.push_back(std::move(key));
   }
   // times: with new keys, every dt from the absolute times; extra (unused by the engine) of the new keys and of a
@@ -822,6 +880,10 @@ scene::Scene FbxToScene(const std::string& path, SceneImportReport& rep) {
     }
   }
   std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.order < b.order; });
+  std::map<long long, const ufbx_node*> targetOf;  // part (x3_order) -> its camera target node
+  for (size_t i = 0; i < s->nodes.count; i++)
+    if (PHas(s->nodes.data[i]->props, "x3_target_of"))
+      targetOf.emplace(PInt(s->nodes.data[i]->props, "x3_target_of"), s->nodes.data[i]);
   std::map<const ufbx_node*, uint32_t> indexOf;
   for (auto& it : items)
     indexOf[it.node] = it.stored ? static_cast<uint32_t>(PInt(it.node->props, "x3_part")) : static_cast<uint32_t>(++maxIndex);
@@ -896,8 +958,60 @@ scene::Scene FbxToScene(const std::string& path, SceneImportReport& rep) {
     }
     const MergeResult merged = MergeKeys(stored, at, fbxTimes, ChannelTimes(s, n, stacks), frame, !it.stored, fromBlender);
     p.keys = merged.keys;
-    bool kept = merged.changed == 0 && merged.added == 0 && !stored.empty();
-    if (!kept && !stored.empty() && p.keys.size() == stored.size()) {  // re-encoded relative keys only
+    // a camera's target node (x3_target_of): its position at each target key is the key's target
+    int targetsMoved = 0;
+    if (auto tit = targetOf.find(PInt(pp, "x3_order", -1)); it.stored && tit != targetOf.end()) {
+      const ufbx_node* tn = tit->second;
+      const ufbx_node* tanchor = anchorOf(tn);
+      const auto ttimes = AnimTimes(s, tn, tanchor, stacks);
+      const auto tchan = ChannelTimes(s, tn, stacks);
+      auto tat = [&](double t) { return Relative(s, tn, tanchor, t, unitMm, stacks).translation; };
+      const auto kt = scene::KeyTimes(p);
+      double prevTs = -1e30;
+      for (size_t i = 0; i < p.keys.size(); i++) {
+        scene::Key& k = p.keys[i];
+        if (!(k.flags & 8) || (k.flags & 0x40)) continue;
+        const double ts = kt[i] / 1000.0;
+        // (baked by Blender: the corner between the frames before it, as for the part's own keys)
+        ufbx_vec3 v = tat(ts);
+        auto itT = std::lower_bound(ttimes.begin(), ttimes.end(), ts - 1e-4);
+        const bool sampled = itT != ttimes.end() && *itT <= ts + 1e-4;
+        if (fromBlender && !sampled && itT - ttimes.begin() >= 2 && *(itT - 2) > prevTs + 1e-4) {
+          const double a = *(itT - 2), b = *(itT - 1), f = (ts - a) / (b - a);
+          const ufbx_vec3 va = tat(a), vb = tat(b);
+          v = {va.x + (vb.x - va.x) * f, va.y + (vb.y - va.y) * f, va.z + (vb.z - va.z) * f};
+        }
+        prevTs = ts;
+        const double want[3] = {v.x, v.y, -v.z}, have[3] = {double(k.Get("tx")), double(k.Get("ty")), double(k.Get("tz"))};
+        // Blender: the timing slack and, where its simplification thinned a channel, 0.5% (as for the parts)
+        double slackT[3] = {0, 0, 0};
+        if (fromBlender) {
+          const ufbx_vec3 v0 = tat(ts - 0.002), v1 = tat(ts + 0.002);
+          const double d[3] = {std::fabs(v1.x - v0.x), std::fabs(v1.y - v0.y), std::fabs(v1.z - v0.z)};
+          for (int c = 0; c < 3; c++) {
+            slackT[c] = d[c];
+            const auto& ch = tchan[c];
+            auto ci = std::lower_bound(ch.begin(), ch.end(), ts - 1e-6);
+            const double next = ci != ch.end() ? *ci : 1e30, prev = ci != ch.begin() ? *(ci - 1) : -1e30;
+            if (!ch.empty() && (next - ts > 1.5 * frame || ts - prev > 1.5 * frame)) slackT[c] += 5e-3 * std::fabs(have[c]);
+          }
+        }
+        const double big = std::max({std::fabs(have[0]), std::fabs(have[1]), std::fabs(have[2])});
+        bool moved = false;
+        for (int c = 0; c < 3; c++) moved |= std::fabs(want[c] - have[c]) > std::max(0.501, big * 4e-7) + slackT[c];
+        if (!moved) continue;
+        auto m = Fields(k);
+        m["tx"] = static_cast<int32_t>(std::llround(want[0]));
+        m["ty"] = static_cast<int32_t>(std::llround(want[1]));
+        m["tz"] = static_cast<int32_t>(std::llround(want[2]));
+        k = MakeKey(k.flags, m);
+        targetsMoved++;
+      }
+      if (targetsMoved)
+        rep.notes.push_back("part P" + std::to_string(p.index) + ": " + std::to_string(targetsMoved) + " target keys moved");
+    }
+    bool kept = merged.changed == 0 && merged.added == 0 && targetsMoved == 0 && !stored.empty();
+    if (!kept && !targetsMoved && !stored.empty() && p.keys.size() == stored.size()) {  // re-encoded relative keys only
       kept = true;
       for (size_t i = 0; kept && i < stored.size(); i++)
         kept = p.keys[i].flags == stored[i].flags && p.keys[i].values == stored[i].values;

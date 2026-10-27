@@ -19,6 +19,7 @@
 #include "derive.hpp"
 #include "fbx_write.hpp"
 #include "scene.hpp"
+#include "scene_anim.hpp"
 #include "scene_fbx.hpp"
 #include "textbody.hpp"
 
@@ -451,9 +452,26 @@ std::vector<size_t> PartNodes(const fbx::Scene& f, size_t parts) {
       if (p.name == "x3_order" && p.i >= 0 && static_cast<size_t>(p.i) < parts) out[p.i] = i;
   return out;
 }
+// a camera's target node: kind 2, the middle target key moved x + 100
+int TargetNode(const fbx::Scene& f, size_t pi) {
+  for (size_t i = 0; i < f.nodes.size(); i++)
+    for (auto& p : f.nodes[i].props)
+      if (p.name == "x3_target_of" && p.i == static_cast<int64_t>(pi)) return static_cast<int>(i);
+  return -1;
+}
 void PerturbAndCheck(const scene::Scene& sc, fbx::Scene& f, std::vector<std::pair<size_t, int>>& edits) {
   const auto nodeOf = PartNodes(f, sc.parts.size());
   for (size_t pi = 0; pi < sc.parts.size(); pi++) {
+    const int tn = TargetNode(f, pi);
+    if (tn >= 0 && f.nodes[tn].animT[0].time.size() >= 3) {
+      auto& c = f.nodes[tn].animT[0];
+      const size_t mid = c.time.size() / 2;
+      if (c.time[mid] != c.time[mid - 1] && c.time[mid] != c.time[mid + 1]) {
+        c.value[mid] += 100;
+        edits.push_back({pi, 2});
+        continue;
+      }
+    }
     fbx::Node& n = f.nodes[nodeOf[pi]];
     const auto& tt = n.animT[0].time;
     if (tt.size() < 3) continue;
@@ -469,9 +487,33 @@ void PerturbAndCheck(const scene::Scene& sc, fbx::Scene& f, std::vector<std::pai
 std::string CheckPerturbed(const scene::Part& before, const scene::Part& after, int kind, const fbx::Node& n, PerturbStats& st) {
   if (after.keys.size() != before.keys.size())
     return std::to_string(before.keys.size()) + " keys became " + std::to_string(after.keys.size());
+  if (kind == 2) {  // exactly the middle target key moved by 100 in x
+    std::vector<size_t> tk;
+    for (size_t j = 0; j < before.keys.size(); j++)
+      if ((before.keys[j].flags & 8) && !(before.keys[j].flags & 0x40)) tk.push_back(j);
+    const size_t mid = tk[tk.size() / 2];
+    for (size_t j = 0; j < before.keys.size(); j++) {
+      scene::Key want = before.keys[j];
+      if (j == mid) {
+        const auto l = scene::KeyLayout(want.flags);
+        for (size_t i = 0; i < l.size(); i++)
+          if (strcmp(l[i].name, "tx") == 0) want.values[i] += 100;
+      }
+      if (after.keys[j].flags != want.flags || after.keys[j].values != want.values)
+        return "key " + std::to_string(j) + (j == mid ? " (the edited target)" : "") + " differs";
+      if (j != mid) st.keysSame++;
+    }
+    return "";
+  }
   const size_t mid = n.animT[0].time.size() / 2;
   const auto a = KeyPosesFbx(before), b = KeyPosesFbx(after);
+  // (keys without their own position / rotation are interpolated by the engine: an edit next to them moves them;
+  // a camera's orientation follows its target)
+  bool aimed = false;
+  for (auto& k : before.keys) aimed |= (k.flags & 8) != 0;
+  auto ownRot = [](uint32_t f) { return !(f & 8) && ((f & 2) || !(f & 0x20)) && !(f & 0x200 && !(f & 2)); };
   for (size_t j = 0; j < a.size(); j++) {
+    if (j != mid && !before.keys[j].Has("x") && (aimed || !ownRot(before.keys[j].flags))) continue;
     std::array<double, 7> want = a[j];
     if (j == mid && kind == 0) want[0] += 100;
     if (j == mid && kind == 1) {
@@ -479,7 +521,7 @@ std::string CheckPerturbed(const scene::Part& before, const scene::Part& after, 
       const auto q = EulerQuat(e);
       for (int k = 0; k < 4; k++) want[3 + k] = q[k];
     }
-    for (int k = 0; k < 3; k++)
+    for (int k = 0; k < 3 && (j == mid || before.keys[j].Has("x")); k++)
       if (std::fabs(want[k] - b[j][k]) > std::max(0.5, std::fabs(want[k]) * 1.2e-7)) {  // (FBX curves are float32)
         char m[200];
         snprintf(m, sizeof m, "key %zu of %zu (mid %zu) position %.1f %.1f %.1f, want %.1f %.1f %.1f, flags %#x->%#x", j,
@@ -487,7 +529,8 @@ std::string CheckPerturbed(const scene::Part& before, const scene::Part& after, 
         return m;
       }
     const double dot = want[3] * b[j][3] + want[4] * b[j][4] + want[5] * b[j][5] + want[6] * b[j][6];
-    if (std::fabs(dot) < 1 - 1e-8) return "key " + std::to_string(j) + " rotation off (dot " + std::to_string(dot) + ")";
+    if (!aimed && (j == mid || ownRot(before.keys[j].flags)) && std::fabs(dot) < 1 - 1e-8)
+      return "key " + std::to_string(j) + " rotation off (dot " + std::to_string(dot) + ")";
     if (j != mid) {
       if (after.keys[j].flags == before.keys[j].flags && after.keys[j].values == before.keys[j].values) st.keysSame++;
       else st.keysReencoded++;
@@ -534,7 +577,8 @@ int CmdRoundtripScenes(const std::string& dir, const std::string& filter, bool p
           pst.parts++;
           const std::string why = CheckPerturbed(sc.parts[pi], back.parts[pi], kind, f.nodes[nodeOf[pi]], pst);
           if (why.empty()) pst.ok++;
-          else if (shown++ < 15) printf("%s P%u (%s): %s\n", e.path.c_str(), sc.parts[pi].index, kind ? "rotation" : "position", why.c_str());
+          else if (shown++ < 15)
+            printf("%s P%u (%s): %s\n", e.path.c_str(), sc.parts[pi].index, kind == 2 ? "target" : kind ? "rotation" : "position", why.c_str());
         }
         continue;
       }
@@ -563,6 +607,29 @@ int CmdRoundtripScenes(const std::string& dir, const std::string& filter, bool p
   }
   for (auto& [k, v] : count) printf("%-12s %d\n", k.c_str(), v);
   return count.size() == 1 && count.count("identical") ? 0 : 1;
+}
+
+// the engine's animation of every part of a scene, sampled: "t P x y z m00 .. m22" per line (16.16 matrix; for
+// checking scene_anim against the reference x3scene.py evaluate_tracks)
+int CmdAnimSample(const std::string& spec, int stepMs) {
+  const scene::Scene sc = scene::Read(LoadInput(spec, nullptr));
+  for (auto& p : sc.parts) {
+    const anim::Tracks tr = anim::Build(p);
+    const int64_t end = anim::Length(tr);
+    for (int64_t t = 0;; t = std::min<int64_t>(t + stepMs, end)) {
+      const anim::State s = anim::Evaluate(tr, t);
+      printf("%lld %u", static_cast<long long>(t), p.index);
+      if (s.pos) printf(" %d %d %d", (*s.pos)[0], (*s.pos)[1], (*s.pos)[2]);
+      else printf(" - - -");
+      for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+          if (s.m) printf(" %d", (*s.m)[r][c]);
+          else printf(" -");
+      printf("\n");
+      if (t >= end) break;
+    }
+  }
+  return 0;
 }
 
 // a catalogue (addon\NN.cat/.dat) holding the given files: "<path inside>=<file>"
@@ -754,6 +821,7 @@ int Main(int argc, const std::vector<std::string>& args) {
       for (int i = 3; i < argc; i++) (strcmp(argv[i], "--perturb") == 0 ? perturb = true : (filter = argv[i], false));
       return CmdRoundtripScenes(argv[2], filter, perturb);
     }
+    if (cmd == "anim-sample" && argc >= 3) return CmdAnimSample(argv[2], argc > 3 ? atoi(argv[3]) : 100);
     if (cmd == "pack") return CmdPack(std::vector<std::string>(argv + 2, argv + argc));
     if (cmd == "roundtrip-fbx" && argc >= 3) return CmdRoundtripFbx(argv[2], argc > 3 ? argv[3] : "");
     if (cmd == "derive-check" && argc >= 3) return CmdDeriveCheck(argv[2], argc > 3 ? argv[3] : "");
