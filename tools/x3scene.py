@@ -548,6 +548,9 @@ def read_text(data, strict=True):
     strict=True fails exactly where the engine's parser sets its error flag."""
     if isinstance(data, str):
         data = data.encode("latin-1")
+    # LoadTextCut puts the terminating NUL over the last byte (0x00491b4b), not after it: a file ending
+    # in '}' without a newline loses the brace and the game refuses it.
+    raw, data = data, data[:-1]
     r = _TR(data, strict)
     sc = Scene("text")
     r.skip_ws()
@@ -571,7 +574,7 @@ def read_text(data, strict=True):
         c = r.char_in("B")
         if c != ord("B"):
             # 0x0049279b: error flag, the parts read so far are kept and the scene is returned
-            sc.tail = data[r.p:].decode("latin-1")
+            sc.tail = raw[r.p:].decode("latin-1")
             r.err = True
             break
         p.body = r.read_string()
@@ -668,7 +671,7 @@ def read_text(data, strict=True):
         sc.parts.append(p)
         c = r.char_in("P")
     if not r.err:
-        sc.tail = data[r.p:].decode("latin-1")
+        sc.tail = raw[r.p:].decode("latin-1")
     return sc
 
 

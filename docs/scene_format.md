@@ -50,6 +50,10 @@ These are the same functions as for `BOB1` bodies (`Body::*`). Stream object: `+
 
 The text lexer **[code]**:
 
+- **The buffer's NUL overwrites the file's last byte** (`Scene::LoadTextCut` `0x00491b4b`: `MOV byte ptr
+  [ECX+EAX-1],0`), it is not added after it. A file that ends in the last key's `}` with no newline loses the
+  brace, the `}` check (`0x0049260e`) fails and the whole scene is refused. The stock files end in CRLF.
+
 - `TextSkipWhitespace` `0x004e98a0`: skips TAB, LF, CR and space; **a single `/` starts a comment up to the end of
   the line** (so `/ ...`, `// ...` and `/====` are all comments; `/` is not allowed in names).
 - `TextParseInt`: optional `-`; `%` means binary, `0x` hexadecimal (with a minus sign - an error), otherwise

@@ -221,9 +221,14 @@ namespace {
 
 // A copy of the engine's text primitives: Body::TextSkipWhitespace 0x004e98a0, TextParseInt 0x004eb930,
 // TextParseFixed16 0x004ec490, TextReadToken 0x004e9930, TextReadCharInSet 0x004ea160. NUL ends the buffer.
+// LoadTextCut puts that NUL over the file's last byte (0x00491b4b), not after it: a file ending in '}' with no
+// newline loses the brace and is refused by the game, so it is refused here too.
 class Tr : public EngineNumbers<Tr> {
  public:
-  explicit Tr(const std::vector<uint8_t>& d) : d_(d) { d_.push_back(0); }
+  explicit Tr(const std::vector<uint8_t>& d) : d_(d) {
+    if (d_.empty()) d_.push_back(0);
+    else d_.back() = 0;
+  }
   bool err = false;
   size_t p = 0;
   int C(size_t k = 0) const { return p + k < d_.size() ? d_[p + k] : 0; }
@@ -376,7 +381,9 @@ Scene ReadText(const std::vector<uint8_t>& data) {
       k.flags = sc.version < 2 ? 1u : static_cast<uint32_t>(r.I32());
       for (auto& f : KeyLayout(k.flags)) k.values.push_back(f.kind == kInt ? r.I32() : r.Fixed());
       if (r.err) throw FormatError("part P " + std::to_string(p.index) + ": key parse error");
-      if (r.CharIn("}") != '}') throw FormatError("part P " + std::to_string(p.index) + ": key not closed by }");
+      if (r.CharIn("}") != '}')
+        throw FormatError("part P " + std::to_string(p.index) +
+                          ": key not closed by } (the game drops the file's last byte: end it with a newline)");
       p.keys.push_back(std::move(k));
     }
     sc.parts.push_back(std::move(p));
