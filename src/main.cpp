@@ -23,12 +23,6 @@
 #include "scene_fbx.hpp"
 #include "textbody.hpp"
 
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
 using namespace x3;
 
 namespace {
@@ -845,6 +839,13 @@ int Main(int argc, const std::vector<std::string>& args) {
   return Usage();
 }
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
 extern "C" {
 int wmain(int argc, wchar_t** wargv) {
   SetConsoleOutputCP(CP_UTF8);
@@ -858,3 +859,9 @@ int wmain(int argc, wchar_t** wargv) {
   return Main(argc, args);
 }
 }
+#else
+int main(int argc, char** argv) {
+    std::vector<std::string> args(argv, argv + argc);
+    return Main(argc, args);
+}
+#endif
