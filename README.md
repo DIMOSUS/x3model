@@ -26,13 +26,30 @@ README, license and documents). Windows x64, no installation: unpack and run `x3
 
 ## Build
 
+No external libraries: FBX is read with the bundled [ufbx](third_party/ufbx) and
+written by an own binary FBX 7.4 writer (`src/fbx_write.cpp`); gzip is inflated by ufbx too. CI builds every push; a tag `v*`
+publishes a release with `x3model.zip` containing Windows distribution of x3model.
+
+### Windows
+
 Windows, Visual Studio 2019 or later with the "Desktop development with C++" workload (it brings CMake and Ninja).
 ```
 build.cmd
 ```
-The result is `build\x3model.exe`. No external libraries: FBX is read with the bundled [ufbx](third_party/ufbx) and
-written by an own binary FBX 7.4 writer (`src/fbx_write.cpp`); gzip is inflated by ufbx too. CI builds every push; a tag `v*`
-publishes a release with `x3model.zip`.
+
+Final executable is `build\x3model.exe`.
+
+## Linux
+
+CMake 3.20 or later, a C++ compiler with GCC-like frontend (Clang also uses GCC frontend) and C++ STL implementation (libc++/libstdc++) are required.
+
+Build using CMake:
+```
+$ cmake -B build -DCMAKE_BUILD_TYPE=Release
+$ cmake --build build -j
+```
+
+Final executable is `./build/x3model`.
 
 ## Commands
 
