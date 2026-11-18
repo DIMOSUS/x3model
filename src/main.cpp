@@ -845,6 +845,7 @@ int Main(int argc, const std::vector<std::string>& args) {
   return Usage();
 }
 
+extern "C" {
 int wmain(int argc, wchar_t** wargv) {
   SetConsoleOutputCP(CP_UTF8);
   std::vector<std::string> args;
@@ -855,4 +856,5 @@ int wmain(int argc, wchar_t** wargv) {
     args.push_back(std::move(s));
   }
   return Main(argc, args);
+}
 }

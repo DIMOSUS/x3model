@@ -21,6 +21,11 @@ add_executable(x3model
   src/ufbx_impl.cpp
 )
 target_include_directories(x3model PRIVATE src third_party/ufbx)
+
+if(MINGW)
+  target_link_options(x3model PUBLIC -municode -static)
+endif()
+
 if(MSVC)
   target_compile_options(x3model PRIVATE /W4 /utf-8 /permissive-)
   target_compile_definitions(x3model PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
